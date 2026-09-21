@@ -3,6 +3,8 @@
 A beautiful music player for the Amiga, for **Navidrome / Subsonic** servers
 and your **own MP3 files**. Version 0.2.
 
+![AmiSubsonic on Workbench 3.2](docs/screenshot.png)
+
 [English](#english) · [Deutsch](#deutsch)
 
 ---
