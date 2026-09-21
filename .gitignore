@@ -1,0 +1,25 @@
+# Build output
+*.o
+*.d
+build/
+/AmiSubsonic
+/AmiSubsonicCLI
+__pycache__/
+
+# MUI developer headers and the original mpega header - not
+# redistributable, see README. Only our own gcc inline header goes in.
+vendor/mui/
+vendor/mpega/mpega.doc
+vendor/mpega/mpega_library.readme
+vendor/mpega/include/libraries/
+
+# Internal notes and local helpers (addresses, tokens, test machines)
+AGENTS.md
+Projekt.md
+amigaBestPractise.md
+push.py
+shot.py
+Screenshots/
+docs/
+
+.DS_Store
