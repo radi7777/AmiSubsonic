@@ -2023,7 +2023,7 @@ int sub_stream_open(struct Prefs *p, const char *songid, long offset,
             "Range: bytes=%ld-\r\n"
             "Connection: close\r\n"
             "\r\n",
-            path, p->host, SUB_CLIENT "/0.2", offset);
+            path, p->host, SUB_CLIENT "/" SUB_VERSION, offset);
 
     total = (long)strlen(req);
     sent = 0;
@@ -2376,7 +2376,7 @@ int sub_radio_open(const char *url, BOOL icy, struct SubStream *st)
                     path, host, port);
         }
         sprintf(req + strlen(req),
-                "User-Agent: %s/0.2\r\n"
+                "User-Agent: %s/" SUB_VERSION "\r\n"
                 "Accept: */*\r\n"
                 "%s"
                 "Connection: close\r\n"
@@ -2560,7 +2560,7 @@ int sub_range_probe(struct Prefs *p, const char *songid, long offset,
             "Range: bytes=%ld-\r\n"
             "Connection: close\r\n"
             "\r\n",
-            path, p->host, SUB_CLIENT "/0.1", offset);
+            path, p->host, SUB_CLIENT "/" SUB_VERSION, offset);
 
     total = (long)strlen(req);
     sent = 0;
@@ -2992,7 +2992,8 @@ int sub_get_lyrics_net(const char *artist, const char *title,
      * Oberflaeche. */
     for (attempt = 0; ; attempt++) {
         rc = http_get_host(LRC_HOST, 443, TRUE, path,
-                           SUB_CLIENT "/0.1 (AmigaOS Subsonic client)",
+                           SUB_CLIENT "/" SUB_VERSION
+                           " (AmigaOS Subsonic client)",
                            &body, &len);
         if (rc == SUB_OK || attempt >= 1
             || !strstr(sub_last_error(), "HTTP 503")) {

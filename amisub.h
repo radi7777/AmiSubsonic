@@ -35,6 +35,10 @@
  * durch aeltere Server. */
 #define SUB_API_VERSION "1.16.1"
 #define SUB_CLIENT      "AmiSubsonic"
+/* Die Version steht NUR hier und in gui.c ($VER). Sie geht als
+ * User-Agent mit jeder Anfrage hinaus - in den Serverprotokollen sieht
+ * man dann, welche Fassung unterwegs war. */
+#define SUB_VERSION     "0.3"
 
 struct Prefs {
     char host[128];             /* nur der Rechnername, ohne Schema */

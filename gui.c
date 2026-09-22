@@ -3603,7 +3603,7 @@ int main(void)
     icon_open();
     app = MUI_NewObject(MUIC_Application,
         MUIA_Application_Title,       "AmiSubsonic",
-        MUIA_Application_Version,     "$VER: AmiSubsonic 0.2 (20.9.2026)",
+        MUIA_Application_Version,     "$VER: AmiSubsonic " SUB_VERSION " (22.9.2026)",
         MUIA_Application_Copyright,   "2026 radi777",
         MUIA_Application_Author,      "radi777",
         MUIA_Application_Description, "Subsonic/Navidrome client",
