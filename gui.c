@@ -1924,9 +1924,9 @@ static int radio_start(void)
 }
 
 /* Einen Sender als nicht abspielbar markieren, sobald der Content-Type
- * es bestaetigt hat. Gesucht wird ueber die ID - die Liste kann seit
- * dem Klick neu geholt worden sein. */
-static void radio_mark_aac(void)
+ * es gezeigt hat (weder MP3 noch AAC). Gesucht wird ueber die ID - die
+ * Liste kann seit dem Klick neu geholt worden sein. */
+static void radio_mark_unplayable(void)
 {
     int i;
 
@@ -1934,7 +1934,7 @@ static void radio_mark_aac(void)
         struct Radio *r = (struct Radio *)list_get(&g_radios, i);
 
         if (r && strcmp(r->id, g_radio_id) == 0) {
-            r->aac = TRUE;
+            r->unplayable = TRUE;
             MUI_Redraw(lst_radio, MADF_DRAWOBJECT);
             break;
         }
@@ -1956,10 +1956,10 @@ static void radio_play(int idx)
         say("this station has no address");
         return;
     }
-    /* AAC kann mpega.library nicht. Gar nicht erst verbinden - die
-     * Zeile steht ohnehin grau da. */
-    if (r->aac) {
-        say("this station streams AAC - not supported");
+    /* Schon einmal am Content-Type gescheitert. Gar nicht erst
+     * verbinden - die Zeile steht ohnehin grau da. */
+    if (r->unplayable) {
+        say("this station's format is not supported");
         return;
     }
 
@@ -3176,19 +3176,19 @@ static void tick(void)
 
     if (audio_track_done() && g_radio_on) {
         /* Ein Sender hoert nicht von selbst auf. Ist der Ring trotzdem
-         * zu Ende, hat der Netzprozess aufgegeben: kein MP3, oder das
-         * Netz blieb laenger weg als die Geduld reicht. Keinesfalls in
-         * die Warteschlange weiterschalten. */
+         * zu Ende, hat der Netzprozess aufgegeben: weder MP3 noch AAC,
+         * oder das Netz blieb laenger weg als die Geduld reicht.
+         * Keinesfalls in die Warteschlange weiterschalten. */
         audio_clear_done();
         g_expect_play = FALSE;
         set(player, MUIA_Pl_Playing, FALSE);
-        if (net_stream_notmp3()) {
+        if (net_stream_unsupported()) {
             char msg[96];
 
             sprintf(msg, "station sends %.40s - "
                     "not supported", net_stream_ctype());
             say(msg);
-            radio_mark_aac();
+            radio_mark_unplayable();
         } else {
             say("station not reachable");
         }

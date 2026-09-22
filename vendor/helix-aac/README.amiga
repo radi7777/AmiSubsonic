@@ -1,0 +1,25 @@
+Helix fixed-point HE-AAC decoder, as used by AmiSubsonic
+=========================================================
+
+Source:  https://github.com/earlephilhower/ESP8266Audio, src/libhelix-aac/
+         commit 74fc1f09bbba5e5c5450b445452ba64ef2d8bbad (2026-07-21)
+Origin:  Helix DNA, RealNetworks, 2005
+
+Licence: the files in this directory (except amiga/ and this README)
+         are subject to the RealNetworks Public Source License, see
+         RPSL.txt (RCSL.txt is the alternative community licence named in
+         the file headers). ESP8266Audio as a whole is GPL-3; only this
+         directory, which keeps its RPSL headers, was taken from it.
+         AmiSubsonic itself stays MIT.
+
+Changes: assembly.h - one added platform block for m68k/gcc (marked
+         "AmiSubsonic modification"). The generic C block that would
+         otherwise be used stores the 64-bit halves little endian, which
+         is wrong on the 68k. No other file is changed.
+
+         amiga/Arduino.h and amiga/pgmspace.h are small stand-ins written
+         for AmiSubsonic (not RealNetworks code), so the sources build
+         unmodified with -DARDUINO.
+
+Not supported by this decoder: parametric stereo (HE-AAC v2 plays as
+mono), LTP, main/SSR profile.

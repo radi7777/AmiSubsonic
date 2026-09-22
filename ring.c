@@ -35,6 +35,7 @@ void ring_reset(struct Ring *r)
     r->eof = FALSE;
     r->stop = FALSE;
     r->filled = 0;
+    r->fmt = RING_MPEG;
 }
 
 /* Ein Platz bleibt immer frei: sonst waere "ganz voll" nicht von "ganz

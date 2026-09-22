@@ -132,9 +132,10 @@ long net_stream_pos(void);      /* schon geholte Bytes ab Dateianfang */
 long net_stream_total(void);    /* Groesse der Datei, 0 = unbekannt */
 LONG net_stream_waited(void);   /* Sekunden, die das Netz weg war */
 const char *net_stream_msg(void);   /* was beim Strom zuletzt geschah */
-/* Radio: TRUE, wenn der Sender kein MP3 liefert. Der Content-Type steht
+/* Radio: TRUE, wenn der Sender weder MP3 noch AAC liefert. Der
+ * Content-Type steht
  * dann in net_stream_ctype(). Beides gilt bis zum naechsten Strom. */
-BOOL net_stream_notmp3(void);
+BOOL net_stream_unsupported(void);
 const char *net_stream_ctype(void);
 /* Radio: laufender Titel aus den ICY-Metadaten ("Interpret - Titel").
  * net_icy_seq() zaehlt jede neue Meldung - die Oberflaeche vergleicht

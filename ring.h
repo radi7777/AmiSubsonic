@@ -23,7 +23,15 @@ struct Ring {
     volatile BOOL  eof;     /* Schreiber ist fertig */
     volatile BOOL  stop;    /* Leser will nicht mehr */
     ULONG  filled;          /* Gesamtzahl geschriebener Bytes, fuer Statistik */
+    /* Was im Ring steckt. Der Schreiber setzt es VOR dem ersten Byte,
+     * der Leser liest es erst, wenn Daten da sind - so ist es nie
+     * halb gueltig. ring_reset stellt MPEG ein: Titel vom Server und
+     * eigene Dateien sind immer MP3, nur ein Sender kann anders. */
+    volatile LONG  fmt;
 };
+
+#define RING_MPEG  0
+#define RING_AAC   1        /* ADTS, wie Radiosender es senden */
 
 BOOL  ring_init(struct Ring *r, ULONG size);
 void  ring_free(struct Ring *r);

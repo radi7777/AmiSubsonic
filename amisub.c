@@ -1818,7 +1818,6 @@ int sub_get_radios(struct Prefs *p, struct SubList *out)
         xml_attr(e, "name",        r->name, sizeof(r->name));
         xml_attr(e, "streamUrl",   r->url,  sizeof(r->url));
         xml_attr(e, "homePageUrl", r->home, sizeof(r->home));
-        r->aac = sub_radio_url_aac(r->url);
         e++;
     }
 
@@ -2417,8 +2416,8 @@ int sub_radio_open(const char *url, BOOL icy, struct SubStream *st)
             return fail(SUB_EHTTP, msg);
         }
 
-        /* Am Inhaltstyp haengt, ob mpega.library ueberhaupt etwas damit
-         * anfangen kann: audio/mpeg ja, audio/aac oder audio/aacp nein. */
+        /* Am Inhaltstyp haengt, welcher Dekoder zustaendig ist:
+         * audio/mpeg geht an mpega.library, audio/aac(p) an Helix. */
         if (head_field(head, "content-type", val, sizeof(val))) {
             copy_field(st->ctype, sizeof(st->ctype), val);
         }
@@ -2447,6 +2446,18 @@ BOOL sub_radio_is_mp3(const char *ctype)
     return strnicmp(ctype, "audio/mpeg", 10) == 0 ||
            strnicmp(ctype, "audio/mp3", 9) == 0 ||
            strnicmp(ctype, "audio/x-mpeg", 12) == 0;
+}
+
+/* Gemessen am 22.9.2026: beide AAC-Sender dieser Instanz melden
+ * "audio/aac" und senden ADTS (HE-AAC). "aacp" ist der alte Name fuer
+ * AAC+ und kommt bei Shoutcast-Sendern vor. */
+BOOL sub_radio_is_aac(const char *ctype)
+{
+    if (!ctype) {
+        return FALSE;
+    }
+    return strnicmp(ctype, "audio/aac", 9) == 0 ||
+           strnicmp(ctype, "audio/x-aac", 11) == 0;
 }
 
 /* Prueft, ob der Server mitten im Titel einsteigen laesst.
@@ -3044,12 +3055,10 @@ int sub_get_song(struct Prefs *p, const char *songid, struct Song *out)
     return SUB_OK;
 }
 
-/* Vermutung aus der Adresse allein, fuer die Liste: dort sollen
- * AAC-Sender grau dastehen, BEVOR jemand draufklickt - acht
- * TLS-Handschlaege nur zum Nachsehen waeren auf 68k zu teuer. Sicher
- * ist erst der Content-Type beim Abspielen; die Oberflaeche merkt sich
- * dann das Ergebnis. Gemessen am 21.9.2026: beide AAC-Sender dieser
- * Instanz enden auf ".../stream/aacp". */
+/* Vermutung aus der Adresse allein. Seit AAC spielt (22.9.2026) nur
+ * noch ein Hinweis in der Senderliste des CLI; ob es geht, entscheidet
+ * der Content-Type beim Abspielen. Gemessen am 21.9.2026: beide
+ * AAC-Sender dieser Instanz enden auf ".../stream/aacp". */
 BOOL sub_radio_url_aac(const char *url)
 {
     const char *s;

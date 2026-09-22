@@ -43,11 +43,26 @@ CFLAGS  = -mcpu=$(CPU) -Os -fomit-frame-pointer -noixemul -MMD -MP \
 # unten als einzelnes Objekt heraus.
 LDFLAGS = -noixemul -s -lgcc
 
-CORE_OBJS = amisub.o md5.o cover.o audio.o ring.o local.o
-CLI_OBJS  = $(CORE_OBJS) cli.o build/DoMethod.o
+CORE_OBJS = amisub.o md5.o cover.o audio.o ring.o local.o aacsize.o aacsize_sbr.o
+
+# Helix AAC (RealNetworks, RPSL - siehe vendor/helix-aac/README.amiga).
+# Eigene Regel mit eigenen Flags: -DARDUINO waehlt dort die normale
+# stdlib, die Ersatz-Header in amiga/ fangen <Arduino.h>/<pgmspace.h>
+# ab, und die Warnungen sind aus - es ist fremder Code, den wir mit
+# Absicht NICHT anfassen (ausser dem 68k-Block in assembly.h).
+# -fwrapv: Helix schiebt vorzeichenbehaftete Werte ueber das Vorzeichen
+# hinaus (UBSan auf dem Mac, 22.9.2026) - formal undefiniert, gemeint ist
+# Zweierkomplement. So bleibt gcc beim Gemeinten, auch bei -O3.
+AAC_DIR   = vendor/helix-aac
+AAC_SRCS  = $(wildcard $(AAC_DIR)/*.c)
+AAC_OBJS  = $(patsubst $(AAC_DIR)/%.c,build/aac/%.o,$(AAC_SRCS))
+AAC_FLAGS = -mcpu=$(CPU) -Os -fomit-frame-pointer -noixemul -MMD -MP -w -fwrapv \
+            -DARDUINO -I$(AAC_DIR)/amiga -I$(AAC_DIR)
+
+CLI_OBJS  = $(CORE_OBJS) cli.o $(AAC_OBJS) build/DoMethod.o
 GUI_OBJS  = $(CORE_OBJS) gui.o panel.o tracklist.o albumgrid.o sidebar.o \
             tabs.o \
-            player.o netjob.o muistubs.o \
+            player.o netjob.o muistubs.o $(AAC_OBJS) \
             build/DoMethod.o build/DoSuperMethod.o
 
 all: AmiSubsonicCLI AmiSubsonic AmiSubsonic.info
@@ -65,6 +80,14 @@ AmiSubsonic: $(GUI_OBJS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Eigene Datei, aber mit Helix' Flags - nur dort kennt man die Groessen.
+aacsize.o aacsize_sbr.o: %.o: %.c
+	$(CC) $(AAC_FLAGS) -c -o $@ $<
+
+build/aac/%.o: $(AAC_DIR)/%.c
+	@mkdir -p build/aac
+	$(CC) $(AAC_FLAGS) -c -o $@ $<
 
 # Nur die beiden gebrauchten Objekte aus amiga.lib, statt der ganzen
 # Bibliothek - siehe die sprintf-Warnung oben bei LDFLAGS. DoMethod fuer
@@ -88,7 +111,7 @@ check-fpu: AmiSubsonicCLI AmiSubsonic
 push: AmiSubsonicCLI AmiSubsonic AmiSubsonic.info
 	python3 push.py AmiSubsonicCLI AmiSubsonic AmiSubsonic.info
 
--include $(CLI_OBJS:.o=.d) $(GUI_OBJS:.o=.d)
+-include $(CORE_OBJS:.o=.d) cli.d $(GUI_OBJS:.o=.d) $(AAC_OBJS:.o=.d)
 
 clean:
 	rm -rf *.o *.d build AmiSubsonicCLI AmiSubsonic

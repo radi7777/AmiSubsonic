@@ -132,8 +132,9 @@ struct Radio {
     char name[SUB_NAME_LEN];
     char url[512];              /* streamUrl */
     char home[256];             /* homePageUrl, kann leer sein */
-    BOOL aac;                   /* nicht abspielbar: erst aus der Adresse
-                                 * geraten, beim Abspielen bestaetigt */
+    BOOL unplayable;            /* Format, das keiner der Dekoder kann -
+                                 * erst beim Abspielen am Content-Type
+                                 * festgestellt, vorher unbekannt */
 };
 
 /* Eine wachsende Liste.
@@ -207,6 +208,9 @@ void sub_stream_close(struct SubStream *st);
 int  sub_radio_open(const char *url, BOOL icy, struct SubStream *st);
 /* TRUE, wenn der Content-Type nach MP3 aussieht (oder fehlt). */
 BOOL sub_radio_is_mp3(const char *ctype);
+/* TRUE, wenn der Content-Type nach AAC im ADTS-Rahmen aussieht - das
+ * kann der Helix-Dekoder. MP4/M4A-Container kann er NICHT. */
+BOOL sub_radio_is_aac(const char *ctype);
 /* TRUE, wenn die Adresse nach AAC aussieht - nur eine Vermutung. */
 BOOL sub_radio_url_aac(const char *url);
 

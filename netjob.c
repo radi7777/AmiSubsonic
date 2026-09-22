@@ -62,7 +62,7 @@ static char  g_st_file[192];
 /* Dritte Quelle: ein Radiosender. Kein Range, keine Laenge, kein Ende -
  * reisst die Verbindung, wird neu verbunden und live weitergehoert. */
 static char  g_st_url[512];
-static BOOL  g_st_notmp3 = FALSE;
+static BOOL  g_st_unsupported = FALSE;
 static char  g_st_ctype[40];
 
 /* ICY: der laufende Titel eines Senders. Mit "Icy-MetaData: 1" steckt
@@ -176,7 +176,7 @@ static void stream_begin(struct NetJob *j)
     }
     strncpy(g_st_url, j->url, sizeof(g_st_url) - 1);
     g_st_url[sizeof(g_st_url) - 1] = '\0';
-    g_st_notmp3 = FALSE;
+    g_st_unsupported = FALSE;
     g_st_ctype[0] = '\0';
     g_icy_metaint = 0;
     Forbid();
@@ -349,9 +349,10 @@ static void icy_feed(const UBYTE *b, long n)
  *     dazwischen gesendet wurde, ist verloren;
  *   - kein Ende: auch ein sauber geschlossener Strom heisst "neu
  *     verbinden", denn ein Sender hoert nicht auf;
- *   - der Content-Type wird geprueft. Liefert der Sender AAC, ist
- *     sofort Schluss - mpega.library kann das nicht, und ohne die
- *     Pruefung liefe der Ring mit Daten voll, die niemand dekodiert. */
+ *   - der Content-Type entscheidet ueber den Dekoder: MP3 geht an
+ *     mpega.library, AAC an Helix (vermerkt im Ring, VOR dem ersten
+ *     Byte). Bei allem anderen ist sofort Schluss - ohne die Pruefung
+ *     liefe der Ring mit Daten voll, die niemand dekodiert. */
 static BOOL radio_slice(void)
 {
     long n;
@@ -383,10 +384,12 @@ static BOOL radio_slice(void)
         sprintf(g_st_msg, "Sender offen, %.30s, %d Weiterleitung(en)",
                 g_st.ctype, g_st.hops);
 
-        if (!sub_radio_is_mp3(g_st.ctype)) {
+        if (sub_radio_is_aac(g_st.ctype)) {
+            g_st_ring->fmt = RING_AAC;
+        } else if (!sub_radio_is_mp3(g_st.ctype)) {
             /* Erst die Markierung, DANN das Ende: die Oberflaeche sieht
              * das Ende und fragt gleich danach, warum. */
-            g_st_notmp3 = TRUE;
+            g_st_unsupported = TRUE;
             stream_close();
             g_st_ring->eof = TRUE;
             g_st_on = FALSE;
@@ -616,9 +619,9 @@ const char *net_stream_msg(void)
     return g_st_msg;
 }
 
-BOOL net_stream_notmp3(void)
+BOOL net_stream_unsupported(void)
 {
-    return g_st_notmp3;
+    return g_st_unsupported;
 }
 
 const char *net_stream_ctype(void)

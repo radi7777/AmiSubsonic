@@ -22,6 +22,13 @@
 #include "audio.h"
 #include "ring.h"
 
+/* aacdec.h kennt keinen 68k und bricht sonst mit #error ab. ARDUINO ist
+ * dort nur ein leerer Plattformzweig - die Rechenroutinen stehen in
+ * assembly.h, das hier gar nicht eingebunden wird. */
+#define ARDUINO
+#include "vendor/helix-aac/aacdec.h"
+#undef ARDUINO
+
 /* ------------------------------------------------------------------ */
 /* Strom aus dem Netz in den Ring (Stufe 2)                            */
 /* ------------------------------------------------------------------ */
@@ -329,6 +336,228 @@ out:
 }
 
 
+/* ------------------------------------------------------------------ */
+/* AAC: Dekodiertempo messen (Helix, Stufe 0 wie "mp3")               */
+/* ------------------------------------------------------------------ */
+
+/* Zwei der acht Sender dieser Instanz senden HE-AAC. Bevor der Dekoder
+ * in den Audioprozess kommt, muss feststehen, dass er auf der Maschine
+ * in Echtzeit laeuft - SBR verdoppelt die Abtastrate und ist der teure
+ * Teil. Gemessen wird deshalb NUR das Dekodieren: der Strom liegt vorher
+ * vollstaendig im Speicher, Netz und AHI zaehlen nicht mit.
+ *
+ * Eine Sendernummer holt das Stueck im Hauptprozess. Das ist erlaubt,
+ * weil hier kein Fueller laeuft - AmiSSL hat also nur einen Besitzer.
+ * Das Stueck landet in T:AmiSubsonic.aac, damit man dieselbe Messung
+ * ohne Netz wiederholen kann (die WLAN-Strecke faellt gern aus). */
+#define AAC_SAVE "T:AmiSubsonic.aac"
+
+static long aac_fetch_radio(struct Prefs *p, int nr, UBYTE *buf, long cap)
+{
+    struct SubList l;
+    struct SubStream st;
+    struct Radio *r;
+    char url[512];
+    long len = 0, n;
+    BPTR fh;
+
+    list_init(&l, sizeof(struct Radio));
+    if (sub_get_radios(p, &l) != SUB_OK) {
+        list_free(&l);
+        return -1;
+    }
+    r = (struct Radio *)list_get(&l, nr - 1);
+    if (!r) {
+        printf("keinen Sender Nr. %d (es gibt %d)\n", nr, l.count);
+        list_free(&l);
+        return -2;
+    }
+    strncpy(url, r->url, sizeof(url) - 1);
+    url[sizeof(url) - 1] = '\0';
+    printf("%s\n", r->name);
+    list_free(&l);
+
+    /* icy = FALSE: sonst stecken Titelbloecke mitten im AAC-Strom. */
+    if (sub_radio_open(url, FALSE, &st) != SUB_OK) {
+        return -1;
+    }
+    printf("%s, %ld kbps laut Sender, hole %ld KB ...\n",
+           st.ctype[0] ? st.ctype : "(kein Typ)", (long)st.bitrate,
+           cap / 1024L);
+    while (len < cap) {
+        if (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C) {
+            break;
+        }
+        n = sub_stream_read(&st, buf + len, (cap - len > 8192L) ? 8192L
+                                                              : cap - len);
+        if (n <= 0) {
+            break;
+        }
+        len += n;
+    }
+    sub_stream_close(&st);
+
+    fh = Open((STRPTR)AAC_SAVE, MODE_NEWFILE);
+    if (fh) {
+        Write(fh, buf, len);
+        Close(fh);
+        printf("gesichert in %s\n", AAC_SAVE);
+    }
+    return len;
+}
+
+/* dump != NULL schreibt das PCM roh in eine Datei (16 Bit, Big Endian,
+ * verschraenkt) - zum Vergleich mit einem Lauf auf dem Mac, der das
+ * Endian-Problem in assembly.h aufdecken wuerde. Die Zeitmessung ist
+ * dann NICHT zu gebrauchen, das Schreiben zaehlt mit. */
+static int cmd_aac(struct Prefs *p, const char *what, long kb,
+                   const char *dump)
+{
+    BPTR out = 0;
+    static short pcm[AAC_MAX_NCHANS * AAC_MAX_NSAMPS * 2];  /* *2: SBR */
+    HAACDecoder h;
+    AACFrameInfo fi, first;
+    UBYTE *buf, *ptr;
+    long cap = kb * 1024L, len;
+    int left, off, err, flen, first_err = 0;
+    ULONG frames = 0, samples = 0, errs = 0, cs_dec, cs_play;
+    LONG t0;
+
+    buf = AllocVec(cap, MEMF_ANY);
+    if (!buf) {
+        printf("zu wenig Speicher fuer %ld KB\n", kb);
+        return SUB_OK;
+    }
+
+    if (what[0] >= '0' && what[0] <= '9') {
+        len = aac_fetch_radio(p, atoi(what), buf, cap);
+        if (len == -1) {
+            FreeVec(buf);
+            return SUB_ENET;
+        }
+    } else {
+        BPTR fh = Open((STRPTR)what, MODE_OLDFILE);
+
+        len = -2;
+        if (fh) {
+            len = Read(fh, buf, cap);
+            Close(fh);
+        } else {
+            printf("kann %s nicht oeffnen\n", what);
+        }
+    }
+    if (len <= 0) {
+        FreeVec(buf);
+        return SUB_OK;
+    }
+
+    h = AACInitDecoder();
+    if (!h) {
+        printf("AACInitDecoder: zu wenig Speicher\n");
+        FreeVec(buf);
+        return SUB_OK;
+    }
+
+    if (dump) {
+        out = Open((STRPTR)dump, MODE_NEWFILE);
+    }
+    memset(&first, 0, sizeof(first));
+    ptr = buf;
+    left = (int)len;
+    t0 = ticks_now();
+    while (left > 0) {
+        if (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C) {
+            break;
+        }
+        /* Nur ADTS - so senden es Radiosender. Die Suche steht auch
+         * nach jedem Fehler, damit ein kaputter Block nicht den Rest
+         * des Stroms mitnimmt. */
+        off = AACFindSyncWord(ptr, left);
+        if (off < 0) {
+            break;
+        }
+        ptr += off;
+        left -= off;
+        /* Helix verlaesst sich darauf, dass der GANZE Block im Puffer
+         * liegt, und liest sonst ueber das Ende hinaus (gemessen auf dem
+         * Mac mit AddressSanitizer, 22.9.2026: der angeschnittene letzte
+         * Block). Die Laenge steht im ADTS-Kopf, 13 Bit ab Bit 30. */
+        if (left < 7) {
+            break;
+        }
+        flen = ((ptr[3] & 3) << 11) | (ptr[4] << 3) | (ptr[5] >> 5);
+        if (flen < 7) {
+            ptr++;                      /* falsches Sync, weitersuchen */
+            left--;
+            continue;
+        }
+        if (flen > left) {
+            break;                      /* letzter Block angeschnitten */
+        }
+        err = AACDecode(h, &ptr, &left, pcm);
+        if (err == ERR_AAC_NONE) {
+            AACGetLastFrameInfo(h, &fi);
+            if (frames == 0) {
+                first = fi;
+            }
+            frames++;
+            if (fi.nChans > 0) {
+                samples += (ULONG)(fi.outputSamps / fi.nChans);
+            }
+            if (out) {
+                Write(out, pcm, (LONG)fi.outputSamps * 2L);
+            }
+        } else if (err == ERR_AAC_INDATA_UNDERFLOW) {
+            break;                      /* letzter Block angeschnitten */
+        } else {
+            if (errs == 0) {
+                first_err = err;
+            }
+            errs++;
+            ptr++;                      /* weiter zum naechsten Sync */
+            left--;
+        }
+    }
+    cs_dec = (ULONG)(ticks_now() - t0) * 2UL;
+    if (out) {
+        Close(out);
+    }
+    AACFreeDecoder(h);
+    FreeVec(buf);
+
+    printf("%ld Bytes, %lu Bloecke, %lu Fehler", len, frames, errs);
+    if (errs) {
+        printf(" (erster: %d)", first_err);
+    }
+    printf("\n");
+    if (frames == 0 || first.sampRateOut <= 0) {
+        printf("kein einziger AAC-Block dekodiert\n");
+        return SUB_OK;
+    }
+    /* In Hundertsteln rechnen: samples * 1000 liefe bei langen
+     * Stuecken ueber 32 Bit. */
+    cs_play = (samples * 100UL) / (ULONG)first.sampRateOut;
+
+    /* Die Bitrate aus Bytes und Spieldauer - Helix fuellt bitRate bei
+     * ADTS nicht (gemessen: immer 0). */
+    printf("%s, Profil %d, %d Kanaele, %d Hz (Kern %d Hz), %lu kbps\n",
+           first.sampRateOut != first.sampRateCore ? "HE-AAC (SBR)"
+                                                    : "AAC-LC",
+           first.profile, first.nChans, first.sampRateOut,
+           first.sampRateCore,
+           cs_play ? ((ULONG)len * 8UL) / (cs_play * 10UL) : 0UL);
+    printf("Spieldauer   %lu.%02lu s\n", cs_play / 100UL, cs_play % 100UL);
+    printf("Dekodierzeit %lu.%02lu s\n", cs_dec / 100UL, cs_dec % 100UL);
+    if (cs_dec > 0) {
+        printf("Faktor       %lu.%02lu-fache Echtzeit, %lu %% der Maschine\n",
+               cs_play / cs_dec, (cs_play * 100UL / cs_dec) % 100UL,
+               cs_play ? cs_dec * 100UL / cs_play : 0UL);
+    } else {
+        printf("Faktor       zu schnell zum Messen\n");
+    }
+    return SUB_OK;
+}
+
 static void usage(void)
 {
     printf(
@@ -352,6 +581,7 @@ static void usage(void)
 "  spiel <datei> [ahi-unit]                    Datei ueber AHI abspielen\n"
 "  stream <titel-id> [weitere ...]             Titel aus dem Netz spielen\n"
 "  radio [nr]                                  Sender auflisten / spielen\n"
+"  aac <datei|sender-nr> [kbytes] [pcm-datei]  AAC-Dekodiertempo messen\n"
 "  ptest <titel-id> [ahi-unit]                 Audioprozess: Pause, Position\n"
 "  range <titel-id> [offset] [format] [kbps]   Einstieg mitten im Titel\n"
 "\n"
@@ -545,6 +775,16 @@ static int run(int argc, char **argv)
 
     if (stricmp(cmd, "?") == 0 || stricmp(cmd, "help") == 0) {
         usage();
+        return 0;
+    }
+
+    /* Eine Datei dekodieren braucht keinen Serverzugang - so laeuft
+     * die Messung auch ohne Prefs, z.B. unter vamos auf dem Mac. */
+    if (stricmp(cmd, "aac") == 0 && argc > 2 &&
+        !(argv[2][0] >= '0' && argv[2][0] <= '9')) {
+        memset(&p, 0, sizeof(p));
+        cmd_aac(&p, argv[2], (argc > 3) ? atol(argv[3]) : 256L,
+                (argc > 4) ? argv[4] : NULL);
         return 0;
     }
 
@@ -784,6 +1024,9 @@ static int run(int argc, char **argv)
 
         ring_free(&g_ring);
         rc = SUB_OK;
+    } else if (stricmp(cmd, "aac") == 0 && argc > 2) {
+        rc = cmd_aac(&p, argv[2], (argc > 3) ? atol(argv[3]) : 256L,
+                     (argc > 4) ? argv[4] : NULL);
     } else if (stricmp(cmd, "radio") == 0 && argc == 2) {
         /* Liste. Das Netz fasst hier der Hauptprozess an - es startet
          * danach kein Fueller mehr, also gibt es keinen zweiten

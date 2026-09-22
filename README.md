@@ -18,7 +18,7 @@ and your **own MP3 files**. Version 0.2.
 - Album cover wall, cover art in true colour, cached on disk
 - Colours follow the cover: background and lists take on its main colour
 - Lyrics from the server, or from lrclib.net when the server has none
-- Internet radio stations of the server, with the current title (MP3 streams)
+- Internet radio stations of the server, with the current title (MP3 and AAC/HE-AAC streams)
 - Home, Albums, Tracks, Favorites, Radio, plus Folder/Albums and Folder/Tracks
 - Own player: pause, seek within a track, queue, next/previous
 - Optional own screen
@@ -48,7 +48,9 @@ request.
 
 ### Notes
 
-- Radio stations in AAC format are shown greyed out and cannot be played.
+- AAC radio is decoded with the Helix fixed-point decoder (ADTS streams,
+  HE-AAC included; HE-AAC v2 plays in mono). Stations in other formats are
+  greyed out once they have been tried.
 - WinUAE / Amiberry: coloured stripes in the covers come from the JIT -
   switch the JIT off.
 - `AmiSubsonicCLI` is a shell tool for testing without the interface.
@@ -73,7 +75,11 @@ is included.
 
 MIT, see [LICENSE](LICENSE). `muistubs.c` comes from
 [amimcp](https://github.com/thomas-luebker/amimcp) and is Apache 2.0
-([LICENSE-Apache-2.0](LICENSE-Apache-2.0)).
+([LICENSE-Apache-2.0](LICENSE-Apache-2.0)). The AAC decoder in
+`vendor/helix-aac/` is the Helix DNA decoder by RealNetworks under the
+RealNetworks Public Source License ([RPSL.txt](vendor/helix-aac/RPSL.txt));
+origin and the one change are listed in
+[README.amiga](vendor/helix-aac/README.amiga).
 
 This program is vibe coded: I described what it should do, an AI wrote the
 code, and I tested and decided what stayed in.
@@ -92,7 +98,7 @@ Tested on an A500 with PiStorm (AmigaOS 3.2) and in WinUAE / Amiberry
 - Bildwand mit Albencovern, Cover in Truecolor, auf Platte zwischengespeichert
 - Farben passen sich dem Cover an: Hintergrund und Listen übernehmen seine Hauptfarbe
 - Liedtexte vom Server oder von lrclib.net, wenn der Server keine hat
-- Internetradio-Sender des Servers mit dem laufenden Titel (MP3-Ströme)
+- Internetradio-Sender des Servers mit dem laufenden Titel (MP3- und AAC/HE-AAC-Ströme)
 - Home, Albums, Tracks, Favorites, Radio, dazu Folder/Albums und Folder/Tracks
 - Eigener Abspieler: Pause, Springen im Titel, Warteschlange, vor/zurück
 - Wahlweise eigener Bildschirm
@@ -123,7 +129,9 @@ jeder Anfrage.
 
 ### Hinweise
 
-- Radiosender im AAC-Format erscheinen grau und lassen sich nicht abspielen.
+- AAC-Radio dekodiert der Helix-Festkommadekoder (ADTS-Ströme, auch
+  HE-AAC; HE-AAC v2 spielt in Mono). Sender in anderen Formaten werden nach
+  dem ersten Versuch grau.
 - WinUAE / Amiberry: bunte Striche in den Covern kommen vom JIT - JIT
   abschalten.
 - `AmiSubsonicCLI` ist ein Shell-Werkzeug zum Testen ohne Oberfläche.
@@ -132,7 +140,8 @@ jeder Anfrage.
 
 Siehe den englischen Teil: gebaut wird mit m68k-amigaos-gcc (`make`,
 `make check-fpu`), die MUI-Header und `libraries/mpega.h` muss man selbst
-beschaffen. Lizenz MIT, `muistubs.c` Apache 2.0.
+beschaffen. Lizenz MIT, `muistubs.c` Apache 2.0, der AAC-Dekoder in
+`vendor/helix-aac/` steht unter der RealNetworks Public Source License.
 
 Dieses Programm ist „vibe coded“: Ich habe beschrieben, was es tun soll,
 eine KI hat den Code geschrieben, und ich habe getestet und entschieden,

@@ -27,6 +27,15 @@
 #include "audio.h"
 #include "ring.h"
 
+/* aacdec.h kennt keinen 68k und bricht sonst mit #error ab. ARDUINO ist
+ * dort nur ein leerer Plattformzweig - die Rechenroutinen stehen in
+ * assembly.h, das hier gar nicht eingebunden wird. */
+#define ARDUINO
+#include "vendor/helix-aac/aacdec.h"
+#undef ARDUINO
+
+extern long aac_state_size(void);       /* aacsize.c */
+
 struct Library *MPEGABase = NULL;
 
 static char g_why[160] = "";
@@ -745,6 +754,295 @@ static LONG vol_fixed(LONG v)
     return (v * 0x10000L) / 64L;
 }
 
+/* Pause: keine neuen Puffer mehr losschicken. Der Ton endet damit,
+ * sobald die schon uebergebenen durch sind - das ist hoechstens eine
+ * knappe halbe Sekunde. Anhalten mitten im Puffer waere nur mit AbortIO
+ * zu haben, und das kostet den sauberen Uebergang.
+ *
+ * Rueckgabe TRUE: der Titel soll abbrechen (HALT, QUIT, neuer Titel).
+ * Fuer beide Dekoder gleich, deshalb hier und nicht zweimal. */
+static BOOL ap_hold(void)
+{
+    while (g_ap_cmd == AC_PAUSE || g_ap_state == AU_PAUSED) {
+        g_ap_state = AU_PAUSED;
+        if (g_ap_cmd == AC_RESUME) {
+            g_ap_cmd = AC_NONE;
+            g_ap_state = AU_PLAYING;
+            break;
+        }
+        if (g_ap_cmd == AC_HALT || g_ap_cmd == AC_QUIT ||
+            g_ap_cmd == AC_PLAY) {
+            break;
+        }
+        g_ap_cmd = AC_NONE;
+        Delay(2);
+    }
+    return g_ap_cmd == AC_HALT || g_ap_cmd == AC_QUIT ||
+           g_ap_cmd == AC_PLAY;
+}
+
+/* Titelende, fuer beide Dekoder gleich.
+ *
+ * "Zu Ende" heisst NUR: der Dekoder hatte nichts mehr. Wurde der Titel
+ * abgebrochen - fuer einen Sprung, einen Wechsel oder STOP - darf das
+ * NICHT als Titelende gelten, sonst schaltet die Warteschlange weiter.
+ *
+ * Genau das ist am 20.9.2026 passiert: ein Klick in den
+ * Fortschrittsbalken sprang nicht, sondern spielte den naechsten Titel -
+ * der Sprung bricht den laufenden ab, und der meldete sich als "durch". */
+static void ap_end(struct Ring *r)
+{
+    BOOL natural = (g_ap_cmd != AC_HALT && g_ap_cmd != AC_QUIT
+                    && g_ap_cmd != AC_PLAY);
+
+    r->stop = TRUE;                     /* der Fueller darf aufhoeren */
+
+    /* Die letzten Puffer auslaufen lassen, sonst fehlt das Ende. Nur bei
+     * HALT wird abgebrochen - dort soll es ja sofort still sein. */
+    g_ap_out.abort = (g_ap_cmd == AC_HALT || g_ap_cmd == AC_QUIT);
+    out_drain(&g_ap_out);
+
+    g_ap_state = AU_STOPPED;
+    if (natural) {
+        g_ap_done = 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* AAC (Helix) - bisher nur fuer Radiosender                           */
+/* ------------------------------------------------------------------ */
+
+/* Anders als mpega.library liest Helix nicht selbst, sondern bekommt
+ * einen Puffer mit mindestens einem GANZEN ADTS-Block. Das ist Pflicht:
+ * einen angeschnittenen Block liest Helix ueber das Pufferende hinaus
+ * (AddressSanitizer auf dem Mac, 22.9.2026), und auf dem Amiga hing
+ * das CLI danach fest, bis zum Neustart.
+ *
+ * Der Eingang fasst zwei der groessten Bloecke - die Laenge im ADTS-Kopf
+ * hat 13 Bit, mehr als 8191 Bytes geht nicht.
+ *
+ * Alles hier ist statisch oder AllocVec: der Audioprozess darf malloc
+ * nicht anfassen (siehe netjob.h). Deshalb auch AACInitDecoderPre mit
+ * eigenem Speicher statt AACInitDecoder. */
+#define AAC_IN  16384
+
+static UBYTE g_aac_in[AAC_IN];
+static LONG  g_aac_len = 0;             /* Bytes im Eingang */
+static LONG  g_aac_off = 0;             /* davon schon verbraucht */
+static WORD  g_aac_pcm[AAC_MAX_NCHANS * AAC_MAX_NSAMPS * 2];   /* *2: SBR */
+static APTR  g_aac_mem = NULL;
+static LONG  g_aac_memsize = 0;
+
+/* Holt aus dem Ring nach, bis mindestens need Bytes im Eingang liegen.
+ * FALSE: es kommt nichts mehr (Ende, Abbruch). Wartet wie der Hook von
+ * mpega - schlafend, nie drehend. */
+static BOOL aac_fill(struct Ring *r, LONG need)
+{
+    BOOL waited = FALSE;
+
+    while (g_aac_len < need) {
+        ULONG n = ring_read(r, g_aac_in + g_aac_len,
+                            (ULONG)(AAC_IN - g_aac_len));
+
+        if (n > 0) {
+            g_aac_len += (LONG)n;
+            continue;
+        }
+        if (r->eof || r->stop || g_ap_cmd == AC_HALT ||
+            g_ap_cmd == AC_QUIT || g_ap_cmd == AC_PLAY) {
+            return FALSE;
+        }
+        if (!waited) {
+            g_hk_waits++;
+            waited = TRUE;
+        }
+        g_hk_wait_ticks++;
+        Delay(1);
+    }
+    return TRUE;
+}
+
+/* Den naechsten Block dekodieren. Rueckgabe: Abtastwerte je Kanal
+ * (> 0), 0 = der Strom ist zu Ende oder abgebrochen, -1 = beim besten
+ * Willen kein AAC darin. */
+static LONG aac_next(struct Ring *r, HAACDecoder h, AACFrameInfo *fi)
+{
+    LONG junk = 0, bad = 0;
+
+    for (;;) {
+        UBYTE *p;
+        int left, sync, err;
+        LONG flen;
+
+        /* Verbrauchtes wegschieben - der Block soll am Anfang liegen,
+         * damit dahinter Platz fuer den groessten moeglichen ist. */
+        if (g_aac_off > 0) {
+            g_aac_len -= g_aac_off;
+            memmove(g_aac_in, g_aac_in + g_aac_off, (size_t)g_aac_len);
+            g_aac_off = 0;
+        }
+        if (g_aac_len < 7 && !aac_fill(r, 7)) {
+            return 0;
+        }
+
+        sync = AACFindSyncWord(g_aac_in, (int)g_aac_len);
+        if (sync < 0) {
+            /* Kein Sync im ganzen Eingang. Das letzte Byte bleibt, es
+             * koennte die erste Haelfte eines Syncworts sein. */
+            g_aac_off = g_aac_len - 1;
+            if (++junk > 64) {
+                return -1;              /* 1 MB ohne einen Block */
+            }
+            continue;
+        }
+        if (sync > 0) {
+            g_aac_off = sync;
+            continue;                   /* erst nach vorn schieben */
+        }
+
+        /* Laenge aus dem ADTS-Kopf, 13 Bit ab Bit 30. Unter 7 ist es
+         * kein Kopf, sondern zufaellig 0xFFF in den Daten. */
+        flen = ((LONG)(g_aac_in[3] & 3) << 11) | ((LONG)g_aac_in[4] << 3)
+             | ((LONG)g_aac_in[5] >> 5);
+        if (flen < 7) {
+            g_aac_off = 1;
+            continue;
+        }
+        if (g_aac_len < flen && !aac_fill(r, flen)) {
+            return 0;
+        }
+
+        p = g_aac_in;
+        left = (int)g_aac_len;
+        err = AACDecode(h, &p, &left, g_aac_pcm);
+        g_aac_off = g_aac_len - left;
+        if (err == ERR_AAC_NONE) {
+            AACGetLastFrameInfo(h, fi);
+            if (fi->nChans > 0 && fi->outputSamps > 0) {
+                return fi->outputSamps / fi->nChans;
+            }
+            continue;
+        }
+        /* Kaputter Block (z.B. nach einem Abriss mitten hinein): ein
+         * Byte weiter und neu suchen. */
+        if (++bad > 64) {
+            return -1;
+        }
+        g_aac_off = 1;
+    }
+}
+
+static void ap_play_aac(struct Ring *r)
+{
+    HAACDecoder h;
+    AACFrameInfo fi;
+    LONG carry_n = 0, carry_pos = 0, chans = 2;
+    ULONG frames = 0;
+    BOOL ended = FALSE;
+
+    /* Speicher fuer den Dekoder einmal holen und behalten, wie AHI. */
+    if (!g_aac_mem) {
+        g_aac_memsize = aac_state_size();
+        g_aac_mem = AllocVec((ULONG)g_aac_memsize, MEMF_PUBLIC | MEMF_CLEAR);
+    }
+    /* AACInitDecoderPre loescht den Zustand selbst - jeder Sender
+     * faengt also frisch an. */
+    h = g_aac_mem ? AACInitDecoderPre(g_aac_mem, (int)g_aac_memsize) : NULL;
+    if (!h) {
+        strcpy(g_why, "out of memory for AAC decoder");
+        r->stop = TRUE;
+        g_ap_state = AU_STOPPED;
+        g_ap_error = 1;
+        return;
+    }
+    g_aac_len = 0;
+    g_aac_off = 0;
+    g_ap_samples = 0;
+    g_ap_state = AU_PLAYING;
+
+    for (;;) {
+        WORD *dst;
+        LONG have = 0;
+
+        if (ap_hold()) {
+            break;
+        }
+
+        dst = g_ap_out.buf[g_ap_out.cur];
+        while (have < AU_FRAMES) {
+            LONG n, i;
+            WORD *src;
+
+            if (carry_n <= 0) {
+                n = aac_next(r, h, &fi);
+                if (n <= 0) {
+                    if (n < 0 && frames == 0) {
+                        /* Wie "no MPEG in stream": ein Fehler, KEIN
+                         * Titelende. */
+                        strcpy(g_why, "no AAC in stream");
+                        g_ap_error = 1;
+                    }
+                    ended = TRUE;
+                    break;
+                }
+                if (frames == 0) {
+                    g_ap_freq = fi.sampRateOut > 0 ? fi.sampRateOut
+                                                   : 44100;
+                }
+                frames++;
+                chans = fi.nChans;
+                carry_n = n;
+                carry_pos = 0;
+            }
+            n = carry_n - carry_pos;
+            if (n > AU_FRAMES - have) {
+                n = AU_FRAMES - have;
+            }
+            /* Helix liefert schon verzahnt (L R L R), anders als mpega.
+             * Mono - auch HE-AAC v2, Parametric Stereo kann Helix nicht -
+             * kommt auf beide Seiten. */
+            if (chans > 1) {
+                src = g_aac_pcm + carry_pos * chans;
+                for (i = 0; i < n; i++) {
+                    *dst++ = src[0];
+                    *dst++ = src[1];
+                    src += chans;
+                }
+            } else {
+                src = g_aac_pcm + carry_pos;
+                for (i = 0; i < n; i++) {
+                    *dst++ = *src;
+                    *dst++ = *src++;
+                }
+            }
+            have += n;
+            carry_pos += n;
+            if (carry_pos >= carry_n) {
+                carry_n = 0;
+                carry_pos = 0;
+            }
+        }
+
+        if (have > 0) {
+            out_send(&g_ap_out, have, g_ap_freq, vol_fixed(g_ap_vol));
+            g_ap_samples += (ULONG)have;
+        }
+        if (ended) {
+            break;
+        }
+    }
+
+    /* Kein AACFreeDecoder: der Speicher ist unserer (Pre), und das
+     * Freigeben dort ginge an free() - also an libnix. */
+    if (g_ap_error) {
+        r->stop = TRUE;
+        out_drain(&g_ap_out);
+        g_ap_state = AU_STOPPED;
+        return;
+    }
+    ap_end(r);
+}
+
 /* Einen Titel dekodieren und ausgeben. Laeuft IM Audioprozess. */
 static void ap_play_track(void)
 {
@@ -757,13 +1055,27 @@ static void ap_play_track(void)
     LONG carry_n = 0, carry_pos = 0;
     LONG skips = 0, bad = 0;
     BOOL ended = FALSE;
-    BOOL natural;
 
     if (!r) {
         return;
     }
     g_hk_waits = 0;
     g_hk_wait_ticks = 0;
+
+    /* Erst warten, bis Daten da sind: das Format steht im Ring, und der
+     * Netzprozess setzt es VOR dem ersten Byte (siehe ring.h). Vorher
+     * hiesse RING_MPEG nur "noch nichts bekannt". Bricht jemand ab oder
+     * kommt nie etwas, geht es wie bisher weiter - MPEGA_open scheitert
+     * dann und meldet es. */
+    while (ring_used(r) == 0 && !r->eof && !r->stop &&
+           g_ap_cmd != AC_HALT && g_ap_cmd != AC_QUIT &&
+           g_ap_cmd != AC_PLAY) {
+        Delay(1);
+    }
+    if (r->fmt == RING_AAC && ring_used(r) > 0) {
+        ap_play_aac(r);
+        return;
+    }
 
     memset(&hook, 0, sizeof(hook));
     hook.h_Entry = (ULONG (*)())mpega_stub;
@@ -800,27 +1112,7 @@ static void ap_play_track(void)
         WORD *dst;
         LONG have = 0;
 
-        /* Pause: keine neuen Puffer mehr losschicken. Der Ton endet
-         * damit, sobald die schon uebergebenen durch sind - das ist
-         * hoechstens eine knappe halbe Sekunde. Anhalten mitten im
-         * Puffer waere nur mit AbortIO zu haben, und das kostet den
-         * sauberen Uebergang. */
-        while (g_ap_cmd == AC_PAUSE || g_ap_state == AU_PAUSED) {
-            g_ap_state = AU_PAUSED;
-            if (g_ap_cmd == AC_RESUME) {
-                g_ap_cmd = AC_NONE;
-                g_ap_state = AU_PLAYING;
-                break;
-            }
-            if (g_ap_cmd == AC_HALT || g_ap_cmd == AC_QUIT ||
-                g_ap_cmd == AC_PLAY) {
-                break;
-            }
-            g_ap_cmd = AC_NONE;
-            Delay(2);
-        }
-        if (g_ap_cmd == AC_HALT || g_ap_cmd == AC_QUIT ||
-            g_ap_cmd == AC_PLAY) {
+        if (ap_hold()) {
             break;
         }
 
@@ -895,30 +1187,8 @@ static void ap_play_track(void)
         g_ap_samples += (ULONG)have;
     }
 
-    /* "Zu Ende" heisst NUR: der Dekoder hatte nichts mehr. Wurde der
-     * Titel abgebrochen - fuer einen Sprung, einen Wechsel oder STOP -
-     * darf das NICHT als Titelende gelten, sonst schaltet die
-     * Warteschlange weiter.
-     *
-     * Genau das ist am 20.9.2026 passiert: ein Klick in den
-     * Fortschrittsbalken sprang nicht, sondern spielte den naechsten
-     * Titel - der Sprung bricht den laufenden ab, und der meldete sich
-     * als "durch". */
-    natural = (g_ap_cmd != AC_HALT && g_ap_cmd != AC_QUIT
-               && g_ap_cmd != AC_PLAY);
-
     MPEGA_close(mps);
-    r->stop = TRUE;                     /* der Fueller darf aufhoeren */
-
-    /* Die letzten Puffer auslaufen lassen, sonst fehlt das Ende. Nur bei
-     * HALT wird abgebrochen - dort soll es ja sofort still sein. */
-    g_ap_out.abort = (g_ap_cmd == AC_HALT || g_ap_cmd == AC_QUIT);
-    out_drain(&g_ap_out);
-
-    g_ap_state = AU_STOPPED;
-    if (natural) {
-        g_ap_done = 1;
-    }
+    ap_end(r);
 }
 
 static void audio_proc(void)
@@ -950,6 +1220,10 @@ static void audio_proc(void)
     }
 
     out_free(&g_ap_out);
+    if (g_aac_mem) {
+        FreeVec(g_aac_mem);
+        g_aac_mem = NULL;
+    }
     if (MPEGABase) {
         CloseLibrary(MPEGABase);
         MPEGABase = NULL;

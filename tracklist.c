@@ -579,12 +579,13 @@ static ULONG tl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
             LONG halfw = textw / 2;
             LONG ty2 = y + (rh - text_height(obj)) / 2;
 
-            /* Ein AAC-Sender laesst sich nicht abspielen. Er bleibt in
-             * der Liste - der Anwender soll sehen, dass es ihn gibt und
-             * warum er nicht geht -, aber grau und mit Vermerk statt
-             * der Homepage. HALFSHADOW wie bei den frueher toten
+            /* Ein Sender in einem Format, das keiner der Dekoder kann
+             * (weder MP3 noch AAC), laesst sich nicht abspielen. Er
+             * bleibt in der Liste - der Anwender soll sehen, dass es ihn
+             * gibt und warum er nicht geht -, aber grau und mit Vermerk
+             * statt der Homepage. HALFSHADOW wie bei den frueher toten
              * Eintraegen der Seitenleiste. */
-            if (r && r->aac) {
+            if (r && r->unplayable) {
                 pen = _pens(obj)[MPEN_HALFSHADOW];
             }
 
@@ -598,7 +599,7 @@ static ULONG tl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
 
             draw_cell(obj, mid, tx, ty2, halfw, pen, FALSE);
             if (r) {
-                draw_cell(obj, r->aac ? "AAC - not supported"
+                draw_cell(obj, r->unplayable ? "format not supported"
                                       : r->home,
                           tx + halfw, ty2, halfw, pen, FALSE);
             }
