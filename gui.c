@@ -750,6 +750,51 @@ static void show_song(int idx)
     set(panel, MUIA_Panel_Meta, (ULONG)meta);
 }
 
+/* Die Anzeigeflaeche auf das zeigen, was gerade LAEUFT.
+ *
+ * Sonst zeigt sie, was man ANSIEHT - ein geoeffnetes Album. Seit ein
+ * Klick in Tracks, Favorites, Folder oder Radio auch die Ansicht
+ * wechselt, gibt es dort aber kein geoeffnetes Album, und es stand das
+ * vorige da: fremdes Cover, fremder Text (vom Anwender gemeldet,
+ * 22.9.2026). In diesem Fall zeigt sie deshalb den laufenden Titel.
+ *
+ * Das Cover geht durch cover_ready(): von dort kommt auch der Farbton
+ * fuer Flaeche, Listen und Reiter. */
+static void panel_show_now(void)
+{
+    char meta[64], total[16];
+
+    if (!g_now_ok) {
+        return;
+    }
+    set(panel, MUIA_Panel_Title,  (ULONG)g_now.title);
+    set(panel, MUIA_Panel_Artist, (ULONG)g_now.artist);
+    set(panel, MUIA_Panel_Album,  (ULONG)g_now.album);
+
+    if (g_radio_on) {
+        /* Ein Sender hat weder Jahr noch Dauer. */
+        strcpy(meta, "Radio");
+    } else {
+        duration_text(g_now.duration, total, sizeof(total));
+        if (g_now.year > 0) {
+            sprintf(meta, "%s  \xb7  %d  \xb7  %s",
+                    g_now.suffix[0] ? g_now.suffix : "?", g_now.year,
+                    total);
+        } else {
+            sprintf(meta, "%s  \xb7  %s",
+                    g_now.suffix[0] ? g_now.suffix : "?", total);
+        }
+    }
+    set(panel, MUIA_Panel_Meta, (ULONG)meta);
+
+    if (g_now_cover[0]) {
+        cover_ready(g_now_cover);
+    } else {
+        /* Kein Cover im Cache: leeren, sonst bliebe das alte stehen. */
+        set(panel, MUIA_Panel_Cover, (ULONG)"");
+    }
+}
+
 /* Die Bedienleiste unten - sie zeigt, was LAEUFT. Gespeist wird sie
  * ausschliesslich aus g_now, nie aus der gerade sichtbaren Liste. */
 static void now_show(void)
@@ -2875,14 +2920,20 @@ static void album_fill(void)
 {
     DoMethod(lst_queue, MUIM_TL_SetList, (ULONG)&g_songs);
 
-    if (g_songs.count > 0) {
-        show_song(0);
-        set(lst_queue, MUIA_TL_Active, 0);
-    }
-
     /* Steht der laufende Titel in der frisch geladenen Liste, wird er
      * wieder markiert. */
     mark_playing();
+
+    /* Und dann auch gezeigt: kommt man ueber einen Klick in Tracks
+     * hierher, ist das Album ja NUR wegen dieses Titels geladen worden -
+     * Zeile 1 waere die falsche (der Anwender, 22.9.2026). Sonst wie
+     * bisher der Anfang des Albums. */
+    if (g_songs.count > 0) {
+        int row = (g_playing >= 0) ? g_playing : 0;
+
+        show_song(row);
+        set(lst_queue, MUIA_TL_Active, row);
+    }
 
     {
         char msg[64];
@@ -2941,6 +2992,57 @@ static void cover_fail_log(const struct NetJob *j)
 }
 
 /* Eine Antwort ist da. */
+/* Aufgeschobene Wuensche nachholen.
+ *
+ * Etwas darf nicht sofort geschehen, solange ein Netzauftrag laeuft:
+ * die Ergebnislisten gehoeren dann dem Arbeitsprozess, und malloc ist
+ * tabu (netjob.h). Der Wunsch wird deshalb gemerkt und hier erledigt,
+ * sobald die Luft rein ist.
+ *
+ * Aufgerufen wird das an ZWEI Stellen: nach jedem fertigen Auftrag und
+ * im Sekundentakt. Nur nach einem Auftrag reicht nicht - ein Album aus
+ * dem eigenen Ordner braucht gar kein Netz, und wenn danach kein
+ * weiterer Auftrag mehr faellig ist, bliebe der Wunsch fuer immer
+ * liegen. Genau so blieb beim Klick auf einen Titel in Folder/Tracks
+ * die Liste UP NEXT stehen (vom Anwender gemeldet, 22.9.2026). */
+static void wants_step(void)
+{
+    /* Hat der Anwender ein Album angetippt, kommt es jetzt dran - vor
+     * der naechsten Miniatur. */
+    if (g_want_album >= 0 && !net_busy()) {
+        int idx = g_want_album;
+
+        g_want_album = -1;
+        album_request(idx);
+    }
+    if (g_want_lalbum >= 0 && !net_busy()) {
+        falbum_open(g_want_lalbum);
+        mark_playing();
+        /* Wie beim Serveralbum: laeuft ein Titel daraus, zeigt die
+         * Flaeche ihn und nicht Zeile 1. */
+        if (g_playing >= 0) {
+            show_song(g_playing);
+            set(lst_queue, MUIA_TL_Active, g_playing);
+        }
+    }
+    if (g_want_album_id[0] && !net_busy()) {
+        char id[SUB_ID_LEN];
+
+        strcpy(id, g_want_album_id);
+        g_want_album_id[0] = '\0';
+        album_request_id(id);
+    }
+
+    /* Dasselbe fuer einen Ansichtswechsel, der auf das Netz warten
+     * musste. */
+    if (g_want_view >= 0 && !net_busy() && !g_list_job) {
+        int v = g_want_view;
+
+        g_want_view = -1;
+        view_show(v);
+    }
+}
+
 static void job_done(struct NetJob *j)
 {
     if (j->rc != SUB_OK && j->op == NJ_COVER) {
@@ -3109,34 +3211,7 @@ static void job_done(struct NetJob *j)
         break;
     }
 
-    /* Hat der Anwender waehrenddessen ein Album angetippt, kommt es
-     * jetzt dran - vor der naechsten Miniatur. */
-    if (g_want_album >= 0 && !net_busy()) {
-        int idx = g_want_album;
-
-        g_want_album = -1;
-        album_request(idx);
-    }
-    if (g_want_lalbum >= 0 && !net_busy()) {
-        falbum_open(g_want_lalbum);
-        mark_playing();
-    }
-    if (g_want_album_id[0] && !net_busy()) {
-        char id[SUB_ID_LEN];
-
-        strcpy(id, g_want_album_id);
-        g_want_album_id[0] = '\0';
-        album_request_id(id);
-    }
-
-    /* Dasselbe fuer einen Ansichtswechsel, der auf das Netz warten
-     * musste. */
-    if (g_want_view >= 0 && !net_busy() && !g_list_job) {
-        int v = g_want_view;
-
-        g_want_view = -1;
-        view_show(v);
-    }
+    wants_step();
 
     /* Die naechste Seite der Titelliste wird NICHT hier angestossen,
      * sondern im Sekundentakt - siehe tick(). */
@@ -3158,6 +3233,9 @@ static void tick(void)
     g_fill_token = TRUE;
 
     say_expire();
+
+    /* Was auf freie Bahn wartet, nachholen - siehe wants_step(). */
+    wants_step();
 
     if (g_fill_hold > 0) {
         g_fill_hold--;
@@ -3943,6 +4021,27 @@ int main(void)
             get(lst_radio, MUIA_TL_Active, &n);
             if (n >= 0) {
                 radio_play((int)n);
+                /* Wie bei den Alben: der Klick zeigt auch, was laeuft.
+                 * Nur wenn der Sender wirklich angeht - sonst bliebe die
+                 * Meldung in der Statuszeile ungelesen, waehrend die
+                 * Ansicht wechselt. */
+                if (g_radio_on) {
+                    show_page(PAGE_PLAYER);
+                    panel_show_now();
+
+                    /* UP NEXT und LYRICS gehoerten zum Album davor - ein
+                     * Sender hat weder Titelliste noch Liedtext. Nur
+                     * ABHAENGEN und leeren, nicht freigeben: list_free()
+                     * waere malloc, und das ist verboten, solange ein
+                     * Netzauftrag laeuft (netjob.h) - der Strom des
+                     * Senders laeuft gerade an. */
+                    DoMethod(lst_queue, MUIM_TL_SetList, (ULONG)NULL);
+                    set(lst_queue, MUIA_TL_Playing, -1);
+                    g_playing = -1;
+                    g_cur_album[0] = '\0';
+                    g_lyrics[0] = '\0';
+                    DoMethod(ft_lyrics, MUIM_TL_SetText, (ULONG)g_lyrics);
+                }
             }
             break;
         }
@@ -3966,6 +4065,14 @@ int main(void)
             if (n >= 0) {
                 queue_from_list(src, (int)n);
                 play_queue(0);
+                /* Wie bei den Alben: hin zu dem, was gerade laeuft -
+                 * mit dessen Cover und Text, nicht mit dem vorigen.
+                 * now_goto() holt dazu das Album des Titels in UP NEXT,
+                 * beim Server ueber das Netz, beim Ordner aus dem
+                 * eigenen Bestand. Bis es da ist, zeigt panel_show_now()
+                 * schon den laufenden Titel. */
+                now_goto();
+                panel_show_now();
             }
             break;
         }

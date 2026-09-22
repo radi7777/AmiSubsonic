@@ -19,6 +19,8 @@ and your **own MP3 files**. Version 0.2.
 - Colours follow the cover: background and lists take on its main colour
 - Lyrics from the server, or from lrclib.net when the server has none
 - Internet radio stations of the server, with the current title (MP3 and AAC/HE-AAC streams)
+- Visualizer tab: spectrum of what you hear, coloured from the cover, with
+  reflection; 15/20/30/60 fps or off, in Settings
 - Home, Albums, Tracks, Favorites, Radio, plus Folder/Albums and Folder/Tracks
 - Own player: pause, seek within a track, queue, next/previous
 - Optional own screen
@@ -53,6 +55,8 @@ request.
   greyed out once they have been tried.
 - WinUAE / Amiberry: coloured stripes in the covers come from the JIT -
   switch the JIT off.
+- The visualizer costs about 12 % of a PiStorm at 30 fps and roughly 30 % at
+  60 fps. It only computes while its tab is visible; "Off" leaves a flat line.
 - `AmiSubsonicCLI` is a shell tool for testing without the interface.
 
 ### Building
@@ -99,6 +103,8 @@ Tested on an A500 with PiStorm (AmigaOS 3.2) and in WinUAE / Amiberry
 - Farben passen sich dem Cover an: Hintergrund und Listen übernehmen seine Hauptfarbe
 - Liedtexte vom Server oder von lrclib.net, wenn der Server keine hat
 - Internetradio-Sender des Servers mit dem laufenden Titel (MP3- und AAC/HE-AAC-Ströme)
+- Visualizer-Reiter: Spektrum des Gehörten, eingefärbt nach dem Cover, mit
+  Spiegelung; 15/20/30/60 Bilder je Sekunde oder aus, in den Einstellungen
 - Home, Albums, Tracks, Favorites, Radio, dazu Folder/Albums und Folder/Tracks
 - Eigener Abspieler: Pause, Springen im Titel, Warteschlange, vor/zurück
 - Wahlweise eigener Bildschirm
@@ -134,6 +140,9 @@ jeder Anfrage.
   dem ersten Versuch grau.
 - WinUAE / Amiberry: bunte Striche in den Covern kommen vom JIT - JIT
   abschalten.
+- Der Visualizer kostet auf einer PiStorm rund 12 % bei 30 und etwa 30 % bei
+  60 Bildern je Sekunde. Er rechnet nur, solange sein Reiter zu sehen ist;
+  „Off“ zeigt eine ruhende Linie.
 - `AmiSubsonicCLI` ist ein Shell-Werkzeug zum Testen ohne Oberfläche.
 
 ### Bauen und Lizenz

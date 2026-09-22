@@ -110,8 +110,32 @@ static ULONG fps_micros(LONG fps)
  * haelt "make check-fpu" ihre Bytes fuer Befehle. */
 #define VIS_DATA __attribute__((section(".data")))
 
-/* MESSUNG (Schritt 1): Zeiten je Bild nach T:AmiSubsonic-vis.log. */
-#define VIS_MEASURE 1
+/* MESSUNG: Zeiten je Bild ins Protokoll. Aus - der Code bleibt stehen,
+ * denn er hat jede Entscheidung an diesem Visualizer entschieden (auf 1
+ * setzen und neu uebersetzen).
+ *
+ * Das Protokoll geht neben das Programm und NICHT nach T:. Nach einem
+ * Freeze mit Reset ist der Arbeitsspeicher leer, und genau die letzten
+ * Zeilen davor sind die interessanten (22.9.2026). Die Datei wird nach
+ * jeder Zeile geschlossen, es geht also nichts verloren. */
+#define VIS_MEASURE 0
+#define VIS_LOG "PROGDIR:vis.log"
+
+/* Was je Spalte feststeht, einmal beim Layout gerechnet (render_bg) statt
+ * in jedem Bild: woher der Pegel kommt, mit welchen Gewichten gemischt
+ * wird, wie weit am linken Rand eingeblendet. Vorher stand hier je Spalte
+ * und Bild u.a. eine Division (22.9.2026). */
+#define VC_FINE   0     /* feine Bins, k und k+1 gemischt */
+#define VC_MAX    1     /* grobe Bins k bis ke, der lauteste */
+#define VC_MIX    2     /* grobe Bins, k und k+1 gemischt */
+
+struct VisCol {
+    UBYTE mode;
+    UBYTE pad;
+    WORD  k, ke;        /* Bins */
+    WORD  mw;           /* Mischgewicht fuer k+1, 0..256 (smoothstep) */
+    WORD  tap;          /* Einblendung am linken Rand, 0..256 */
+};
 
 struct VisData {
     ULONG  colour;
@@ -128,11 +152,23 @@ struct VisData {
     ULONG *rowcol;
     WORD  *old0, *old1;
 
-    /* Je Zeile: Farbe der Linie (nach Hoehe) und Deckkraft der
-     * Spiegelung (0..16). Haengen an Groesse UND Farbton. */
+    /* Je Spalte zusaetzlich der VOLL gedeckte Innenteil der Spanne aus
+     * dem letzten Bild. Dort steht schon die Linienfarbe - wenn er beim
+     * naechsten Bild wieder innen liegt, muss niemand hinschreiben. */
+    WORD  *in0, *in1;
+
+    /* Je Zeile: Farbe der Linie (nach Hoehe), Farbe der Spiegelung bei
+     * voller Deckung, und deren Deckkraft (0..6 von 16). Haengen an
+     * Groesse UND Farbton. */
     ULONG *linecol;
+    ULONG *refcol;
     UBYTE *rfade;
+
+    /* Geaenderte Zeilen je senkrechtem Streifen - nur die gehen zur
+     * Grafikkarte, siehe vis_draw(). */
+    LONG   slo[8], shi[8];
     LONG  *colbin;              /* je Spalte (und eine dahinter): Bin in 1/256 */
+    struct VisCol *cols;        /* je Spalte, siehe struct VisCol */
     LONG   base, amp;           /* Grundlinie, volle Hoehe */
 
     struct MUI_InputHandlerNode ihn;
@@ -246,6 +282,7 @@ static UWORD g_rev[VIS_N];                      /* Bitumkehr */
 static WORD  g_mono[VIS_HIST];                  /* aelteste zuerst */
 static WORD  g_dec[VIS_N];                      /* je 4 gemittelt */
 static ULONG g_pw[VIS_BINS];                    /* Leistung je Bin */
+static ULONG g_pwf[VIS_FINE];                   /* dasselbe, feine Bins */
 static LONG  g_re[VIS_N], g_im[VIS_N];
 
 static LONG qsin(LONG k)
@@ -356,24 +393,45 @@ static LONG log2_256(ULONG p)
     return n * 256 + g_logf[idx];
 }
 
-/* 1024 Abtastwerte ab src durch Fenster und FFT, Leistung je Bin nach
- * g_pw. Fuer beide FFTs dieselbe Rechnung. */
-static void fft_power(const WORD *src)
+/* Beide FFTs in EINEM Durchgang: fine (die gemittelten Bass-Werte) in
+ * den Realteil, coarse (die juengsten 1024) in den Imaginaerteil. Weil
+ * beide Eingaben reell sind, lassen sich die Spektren danach trennen:
+ *
+ *   A[k] = (Z[k] + konj(Z[N-k])) / 2        (fine)
+ *   B[k] = (Z[k] - konj(Z[N-k])) / (2i)     (coarse)
+ *
+ * Halbe Rechenzeit fuer dasselbe (22.9.2026: zwei FFTs 3,3 ms je Bild).
+ *
+ * Beide Eingaben werden vorher halbiert: der Betrag eines komplexen
+ * Werts darf sonst bis 32767 * Wurzel 2 wachsen, und die Anteile passen
+ * nicht mehr in die 16 Bit der muls.w. Das kostet ein Bit - die
+ * mitlaufende Untergrenze gleicht den Pegel aus. */
+static void fft_two(const WORD *fine, const WORD *coarse)
 {
     LONG i, k;
 
     for (i = 0; i < VIS_N; i++) {
         LONG r = g_rev[i];
 
-        g_re[r] = MULQ15(src[i], g_hann[i]);
-        g_im[r] = 0;
+        g_re[r] = MULQ15(fine[i], g_hann[i]) >> 1;
+        g_im[r] = MULQ15(coarse[i], g_hann[i]) >> 1;
     }
     fft();
-    for (k = 0; k < VIS_BINS; k++) {
-        LONG re = g_re[k], im = g_im[k];
 
-        g_pw[k] = (ULONG)((LONG)(WORD)re * (WORD)re)
-                + (ULONG)((LONG)(WORD)im * (WORD)im);
+    for (k = 0; k < VIS_BINS; k++) {
+        LONG j = (VIS_N - k) & (VIS_N - 1);
+        LONG br = (g_im[k] + g_im[j]) >> 1;
+        LONG bi = (g_re[j] - g_re[k]) >> 1;
+
+        g_pw[k] = (ULONG)((LONG)(WORD)br * (WORD)br)
+                + (ULONG)((LONG)(WORD)bi * (WORD)bi);
+        if (k < VIS_FINE) {
+            LONG ar = (g_re[k] + g_re[j]) >> 1;
+            LONG ai = (g_im[k] - g_im[j]) >> 1;
+
+            g_pwf[k] = (ULONG)((LONG)(WORD)ar * (WORD)ar)
+                     + (ULONG)((LONG)(WORD)ai * (WORD)ai);
+        }
     }
 }
 
@@ -416,23 +474,23 @@ static void spectrum(struct VisData *d)
     LONG i, k, sum = 0, lo;
 
     /* Fein: je 4 mitteln (ein einfacher Tiefpass - was dabei aus hohen
-     * Frequenzen herunterklappt, stoert die Optik nicht), dann FFT. */
+     * Frequenzen herunterklappt, stoert die Optik nicht). Dann beide
+     * FFTs auf einmal. */
     for (i = 0; i < VIS_N; i++) {
         const WORD *m = g_mono + i * VIS_DEC;
 
         g_dec[i] = (WORD)(((LONG)m[0] + m[1] + m[2] + m[3]) >> 2);
     }
-    fft_power(g_dec);
+    fft_two(g_dec, g_mono + VIS_HIST - VIS_N);
     for (k = VIS_DEC; k < VIS_FINE; k++) {
         /* Glaetten auf der LEISTUNG, halb alt, halb neu. Neigung wie bei
          * den groben Bins: k fein ist k/4 grob, log2(4) = 2 Stufen. */
-        d->fplin[k] = (d->fplin[k] >> 1) + (g_pw[k] >> 1);
+        d->fplin[k] = (d->fplin[k] >> 1) + (g_pwf[k] >> 1);
         flg[k] = (d->fplin[k] ? log2_256(d->fplin[k]) : 0)
                + (log2_256((ULONG)k) - 2 * 256) * 3 / 4;
     }
 
-    /* Grob: die juengsten 1024 Werte. */
-    fft_power(g_mono + VIS_HIST - VIS_N);
+    /* Grob: die juengsten 1024 Werte, aus demselben Durchgang. */
     for (k = 1; k < VIS_BINS; k++) {
         /* Glaetten auf der LEISTUNG, halb alt, halb neu - das gibt
          * runde Huegel statt Zittern. Drei Viertel alt (wie im Browser)
@@ -509,7 +567,7 @@ static void measure_log(struct VisData *d, LONG w, LONG h)
     el = (d->m_efreq >= 100) ? (now - d->m_start) / (d->m_efreq / 100UL) : 0;
     fps100 = el ? d->m_frames * 10000UL / el : 0;
 
-    fh = Open((STRPTR)"T:AmiSubsonic-vis.log", MODE_READWRITE);
+    fh = Open((STRPTR)VIS_LOG, MODE_READWRITE);
     if (fh) {
         Seek(fh, 0, OFFSET_END);
         FPrintf(fh, "%ldx%ld: %ld Bilder, %ld.%02ld Bilder/s | FFT %ld.%02ld ms"
@@ -608,17 +666,46 @@ static BOOL ensure_buf(struct VisData *d, LONG w, LONG h)
      * verlangen, auch mitten in einem Netzauftrag (siehe netjob.h).
      * Ein Block fuer alles: Bild, Zeilenfarben, alte Spannen. */
     px = (ULONG)w * (ULONG)h;
-    bytes = px * 4UL + (ULONG)h * 8UL + (ULONG)w * 8UL + (ULONG)h + 8UL;
+    bytes = px * 4UL                    /* Bild */
+          + (ULONG)h * 12UL             /* rowcol, linecol, refcol */
+          + (ULONG)w * 8UL              /* old0, old1, in0, in1 */
+          + (ULONG)(w + 1) * 4UL        /* colbin */
+          + (ULONG)w * sizeof(struct VisCol)
+          + (ULONG)h + 8UL;             /* rfade */
     d->buf = AllocVec(bytes, MEMF_ANY);
     if (!d->buf) {
         return FALSE;
     }
+#if VIS_MEASURE
+    /* Liegt der Puffer im Chip-RAM, geht auf der PiStorm jeder Zugriff
+     * ueber den echten A500-Bus - das waere der groesste Hebel. */
+    {
+        BPTR fh = Open((STRPTR)VIS_LOG, MODE_READWRITE);
+
+        if (fh) {
+            ULONG m = TypeOfMem(d->buf), n = TypeOfMem(g_re);
+
+            Seek(fh, 0, OFFSET_END);
+            FPrintf(fh, "Puffer %ld KB: %s, FFT-Felder: %s\n",
+                    (LONG)(bytes >> 10),
+                    (LONG)(ULONG)((m & MEMF_CHIP) ? "CHIP" :
+                                  (m & MEMF_FAST) ? "FAST" : "?"),
+                    (LONG)(ULONG)((n & MEMF_CHIP) ? "CHIP" :
+                                  (n & MEMF_FAST) ? "FAST" : "?"));
+            Close(fh);
+        }
+    }
+#endif
     d->rowcol = d->buf + px;
-    d->old0 = (WORD *)(d->rowcol + h);
+    d->linecol = d->rowcol + h;
+    d->refcol = d->linecol + h;
+    d->colbin = (LONG *)(d->refcol + h);
+    d->cols = (struct VisCol *)(d->colbin + w + 1);
+    d->old0 = (WORD *)(d->cols + w);
     d->old1 = d->old0 + w;
-    d->linecol = (ULONG *)(d->old1 + w);
-    d->colbin = (LONG *)(d->linecol + h);
-    d->rfade = (UBYTE *)(d->colbin + w + 1);
+    d->in0 = d->old1 + w;
+    d->in1 = d->in0 + w;
+    d->rfade = (UBYTE *)(d->in1 + w);
     d->buf_w = w;
     d->buf_h = h;
     d->buf_ok = FALSE;
@@ -678,6 +765,8 @@ static LONG rgb_hue(ULONG rgb)
     }
     return (h < 0) ? h + 1536 : h;
 }
+
+static ULONG blend(ULONG bg, ULONG fg, LONG a);
 
 /* Hintergrund einmal ganz: Verlauf wie in der Liste daneben. Dazu die
  * Farben je Zeile. Danach steht alles im Puffer, und je Bild wird nur
@@ -769,8 +858,71 @@ static void render_bg(struct VisData *d, LONG w, LONG h)
         }
     }
     for (x = 0; x < w; x++) {
+        LONG fb = d->colbin[x], fe = d->colbin[x + 1];
+        LONG taper = (w / 10 > 1) ? w / 10 : 1;
+        struct VisCol *c = &d->cols[x];
+
+        if (fb < (VIS_FINE / VIS_DEC) * 256) {
+            /* Bass: aus den feinen Bins. Stelle in 1/256 grob mal 4 ist
+             * die Stelle in 1/256 fein. Die Spalten sind hier fast immer
+             * schmaler als ein feiner Bin - weich uebergehen. */
+            LONG ff = fb * VIS_DEC, fk = ff >> 8, fr = ff & 255;
+
+            if (fk < VIS_DEC) {
+                fk = VIS_DEC;
+                fr = 0;
+            }
+            c->mode = VC_FINE;
+            c->k = (WORD)fk;
+            c->mw = (fk + 1 < VIS_FINE)
+                  ? (WORD)((fr * fr * (768 - 2 * fr)) >> 16) : 0;
+        } else if (fe - fb >= 256) {
+            /* Rechts: mehrere Bins in dieser Spalte - der lauteste
+             * zaehlt, sonst verschwinden die Spitzen. */
+            LONG ke = fe >> 8;
+
+            if (ke >= VIS_BINS) {
+                ke = VIS_BINS - 1;
+            }
+            c->mode = VC_MAX;
+            c->k = (WORD)(fb >> 8);
+            c->ke = (WORD)ke;
+        } else {
+            /* Mitten: eine Spalte ist schmaler als ein Bin - weich
+             * zwischen zwei Bins uebergehen (smoothstep, f*f*(3-2f)). */
+            LONG k = fb >> 8, f = fb & 255;
+
+            c->mode = VC_MIX;
+            c->k = (WORD)k;
+            c->mw = (k + 1 < VIS_BINS)
+                  ? (WORD)((f * f * (768 - 2 * f)) >> 16) : 0;
+        }
+
+        /* Links weich von der Grundlinie aus einblenden. Die tiefsten
+         * Bins (43 bis 86 Hz) sind fast immer laut - Bass laeuft dauernd,
+         * und das Fenster streut etwas Gleichanteil hinein. Ohne das
+         * stand die Linie am linken Rand hoch und stieg mit einem
+         * senkrechten Strich aus der Grundlinie (Fotos des Anwenders,
+         * 22.9.2026); bei Feishin beginnt sie unten. */
+        if (x < taper) {
+            LONG t = x * 256 / taper;
+
+            c->tap = (WORD)((t * t * (768 - 2 * t)) >> 16);  /* smoothstep */
+        } else {
+            c->tap = 256;
+        }
+
         d->old0[x] = 1;
         d->old1[x] = 0;
+        d->in0[x] = 1;
+        d->in1[x] = 0;
+    }
+    /* Spiegelung bei voller Deckung: je Zeile einmal gemischt statt je
+     * Bildpunkt und Bild. */
+    for (y = 0; y < h; y++) {
+        d->refcol[y] = d->rfade[y] ? blend(d->rowcol[y], d->linecol[y],
+                                           d->rfade[y] * 16)
+                                   : d->rowcol[y];
     }
     d->buf_col = d->colour;
     d->buf_ok = TRUE;
@@ -788,141 +940,168 @@ static ULONG blend(ULONG bg, ULONG fg, LONG a)
     return ((ULONG)br << 16) | ((ULONG)bgg << 8) | (ULONG)bb;
 }
 
-/* Die Linie austauschen. Rueckgabe in band0, band1: die Zeilen, die sich
- * geaendert haben - nur die gehen danach zur Grafikkarte.
+/* Eine Zeile als geaendert vermerken - fuer den Streifen der Spalte. */
+#define MARK(sl, y) do { if ((y) < d->slo[sl]) d->slo[sl] = (y); \
+                          if ((y) > d->shi[sl]) d->shi[sl] = (y); } while (0)
+
+/* Die Linie austauschen. Danach steht in d->slo/shi je Streifen, welche
+ * Zeilen sich geaendert haben - nur die gehen zur Grafikkarte.
  *
  * Jede Spalte zeichnet nur ihre eigenen Bildpunkte: die senkrechte
  * Spanne zwischen der Hoehe der vorigen Spalte und ihrer eigenen, in
  * Sechzehnteln eines Bildpunkts, um eine dreiviertel Zeile verbreitert.
  * Die Randzeilen bekommen nur ihren Anteil - das ist die Kantenglaettung.
- * Weil keine Spalte in eine andere malt, laesst sich jede fuer sich
- * wieder wegwischen. */
-static void render_line(struct VisData *d, LONG w, LONG h,
-                        LONG *band0, LONG *band1)
+ *
+ * Und nur, was sich AENDERT (22.9.2026: 6,5 ms je Bild fuer das
+ * Zeichnen, mehr als die FFT): zwischen zwei Bildern ueberlappen sich
+ * die Spannen fast immer, und innen steht beide Male dieselbe Farbe -
+ * sie haengt nur an der Zeile. Also: wiederherstellen, was herausfaellt;
+ * innen nur schreiben, was vorher nicht innen war; mischen nur an den
+ * hoechstens zwei Randzeilen. Das Ergebnis ist Bildpunkt fuer Bildpunkt
+ * dasselbe wie vorher (am Mac nachgeprueft). */
+static void render_line(struct VisData *d, LONG w, LONG h)
 {
     LONG base16 = d->base * 16;
     LONG x, y, prev16 = base16;
-    LONG taper = (w / 10 > 1) ? w / 10 : 1;
-    LONG lo = h, hi = -1;
     LONG b2 = 2 * d->base;
+    LONG sl = 0, snext = w / 8;
+
+    for (x = 0; x < 8; x++) {
+        d->slo[x] = h;
+        d->shi[x] = -1;
+    }
 
     for (x = 0; x < w; x++) {
-        LONG fb = d->colbin[x], fe = d->colbin[x + 1];
-        LONG k = fb >> 8, f = fb & 255, lev, y16, s0, s1, ya, yb, m0, m1;
+        const struct VisCol *c = &d->cols[x];
+        LONG lev, y16, s0, s1;
+        LONG ya, yb, fa, fz, o0, o1, i0, i1, lo, hi, my;
         ULONG *col = d->buf + x;
 
-        if (fb < (VIS_FINE / VIS_DEC) * 256) {
-            /* Bass: aus den feinen Bins. Stelle in 1/256 grob mal 4 ist
-             * die Stelle in 1/256 fein. Die Spalten sind hier fast immer
-             * schmaler als ein feiner Bin - weich uebergehen. */
-            LONG ff = fb * VIS_DEC, fk = ff >> 8, fr = ff & 255;
+        if (x >= snext && sl < 7) {
+            sl++;
+            snext = (sl + 1) * w / 8;
+        }
 
-            if (fk < VIS_DEC) {
-                fk = VIS_DEC;
-                fr = 0;
-            }
-            fr = (fr * fr * (768 - 2 * fr)) >> 16;  /* smoothstep */
-            lev = d->flevel[fk];
-            if (fk + 1 < VIS_FINE) {
-                lev = (lev * (256 - fr) + d->flevel[fk + 1] * fr) >> 8;
-            }
-        } else if (fe - fb >= 256) {
-            /* Rechts: mehrere Bins in dieser Spalte - der lauteste
-             * zaehlt, sonst verschwinden die Spitzen. */
-            LONG ke = fe >> 8;
+        /* Pegel der Spalte, nach der Tabelle aus render_bg(). */
+        if (c->mode == VC_MAX) {
+            const WORD *lv = d->level + c->k;
+            LONG n = c->ke - c->k;
 
-            if (ke >= VIS_BINS) {
-                ke = VIS_BINS - 1;
-            }
             lev = 0;
-            for (; k <= ke; k++) {
-                if (d->level[k] > lev) {
-                    lev = d->level[k];
+            do {
+                if (*lv > lev) {
+                    lev = *lv;
                 }
-            }
+                lv++;
+            } while (--n >= 0);
         } else {
-            /* Mitten: eine Spalte ist schmaler als ein Bin - weich
-             * zwischen zwei Bins uebergehen (smoothstep, f*f*(3-2f)). */
-            f = (f * f * (768 - 2 * f)) >> 16;
-            lev = d->level[k];
-            if (k + 1 < VIS_BINS) {
-                lev = (lev * (256 - f) + d->level[k + 1] * f) >> 8;
-            }
-        }
-        /* Links weich von der Grundlinie aus einblenden. Die tiefsten
-         * Bins (43 bis 86 Hz) sind fast immer laut - Bass laeuft dauernd,
-         * und das Fenster streut etwas Gleichanteil hinein. Ohne das
-         * stand die Linie am linken Rand hoch und stieg mit einem
-         * senkrechten Strich aus der Grundlinie (Fotos des Anwenders,
-         * 22.9.2026); bei Feishin beginnt sie unten. */
-        if (x < taper) {
-            LONG t = x * 256 / taper;
+            const WORD *lv = (c->mode == VC_FINE) ? d->flevel + c->k
+                                                  : d->level + c->k;
 
-            t = (t * t * (768 - 2 * t)) >> 16;      /* smoothstep */
-            lev = (lev * t) >> 8;
+            lev = (c->mw) ? (lv[0] * (256 - c->mw) + lv[1] * c->mw) >> 8
+                          : lv[0];
         }
-        y16 = base16 - lev * d->amp * 16 / 4096;
+        lev = (lev * c->tap) >> 8;
+
+        /* Hoehe in Sechzehnteln: lev * amp * 16 / 4096, als Schieben -
+         * fuer lev >= 0 genau dasselbe, ohne Division. */
+        y16 = base16 - ((lev * d->amp) >> 8);
         s0 = ((y16 < prev16) ? y16 : prev16) - 12;
         s1 = ((y16 < prev16) ? prev16 : y16) + 12;
         prev16 = y16;
+
+        /* Beruehrte Zeilen ya..yb, davon voll gedeckt fa..fz. Unter der
+         * Grundlinie zeichnet nur die Spiegelung. */
         ya = s0 >> 4;
-        yb = s1 >> 4;
-        if (ya < 0) {
-            ya = 0;
-        }
-        if (yb > d->base) {
-            yb = d->base;               /* unter der Grundlinie: Spiegelung */
+        yb = (s1 - 1) >> 4;
+        fa = (s0 + 15) >> 4;
+        fz = (s1 >> 4) - 1;
+        if (ya < 0) { ya = 0; }
+        if (fa < 0) { fa = 0; }
+        if (yb > d->base) { yb = d->base; }
+        if (fz > d->base) { fz = d->base; }
+
+        o0 = d->old0[x];
+        o1 = d->old1[x];
+        i0 = d->in0[x];
+        i1 = d->in1[x];
+        lo = h;
+        hi = -1;
+
+        /* 1. Was aus der Spanne herausfaellt: Hintergrund. */
+        for (y = o0; y <= o1; y++) {
+            if (y >= ya && y <= yb) {
+                y = yb;                 /* den Rest der neuen ueberspringen */
+                continue;
+            }
+            col[y * w] = d->rowcol[y];
+            my = b2 - y;
+            if (my > d->base && my < h) {
+                col[my * w] = d->rowcol[my];
+            }
+            if (y < lo) { lo = y; }
+            if (y > hi) { hi = y; }
         }
 
-        /* Die alte Spanne wegwischen, oben und gespiegelt. Auch wenn sie
-         * gleich geblieben ist: die Kantenanteile koennen sich geaendert
-         * haben. */
-        if (d->old0[x] <= d->old1[x]) {
-            for (y = d->old0[x]; y <= d->old1[x]; y++) {
-                col[y * w] = d->rowcol[y];
+        /* 2. Innen: nur, was vorher nicht innen war. */
+        for (y = fa; y <= fz; y++) {
+            if (y >= i0 && y <= i1) {
+                y = i1;
+                continue;
             }
-            m0 = b2 - d->old1[x];
-            m1 = b2 - d->old0[x];
-            if (m1 >= h) {
-                m1 = h - 1;
+            col[y * w] = d->linecol[y];
+            my = b2 - y;
+            if (my > d->base && my < h) {
+                col[my * w] = d->refcol[my];
             }
-            for (y = m0; y <= m1; y++) {
-                col[y * w] = d->rowcol[y];
-            }
-            if (d->old0[x] < lo) { lo = d->old0[x]; }
-            if (m1 > hi) { hi = m1; }
+            if (y < lo) { lo = y; }
+            if (y > hi) { hi = y; }
         }
 
-        /* Die neue zeichnen. */
+        /* 3. Die Randzeilen: nur ihren Anteil, gemischt. */
         for (y = ya; y <= yb; y++) {
-            LONG c0 = y * 16, c1 = c0 + 16, cov, my;
+            LONG c0, c1, cov;
 
+            if (y == fa && fa <= fz) {
+                y = fz;                 /* innen ist schon erledigt */
+                continue;
+            }
+            c0 = y * 16;
+            c1 = c0 + 16;
             if (c0 < s0) { c0 = s0; }
             if (c1 > s1) { c1 = s1; }
-            cov = c1 - c0;              /* 0..16 */
+            cov = c1 - c0;
             if (cov <= 0) {
                 continue;
             }
             col[y * w] = blend(d->rowcol[y], d->linecol[y], cov * 16);
-
             my = b2 - y;
             if (my > d->base && my < h && d->rfade[my]) {
                 col[my * w] = blend(d->rowcol[my], d->linecol[my],
                                     cov * d->rfade[my]);
             }
+            if (y < lo) { lo = y; }
+            if (y > hi) { hi = y; }
         }
+
         d->old0[x] = (WORD)ya;
         d->old1[x] = (WORD)yb;
-        if (ya < lo) { lo = ya; }
-        m1 = b2 - ya;
-        if (m1 >= h) {
-            m1 = h - 1;
+        d->in0[x] = (WORD)fa;
+        d->in1[x] = (WORD)fz;
+
+        /* Streifen: oben lo, unten die Spiegelung von lo. */
+        if (hi >= lo) {
+            MARK(sl, lo);
+            MARK(sl, hi);
+            my = b2 - lo;
+            if (my >= h) {
+                my = h - 1;
+            }
+            if (my > d->base) {
+                MARK(sl, my);
+            }
         }
-        if (m1 > hi) { hi = m1; }
-        if (yb > hi) { hi = yb; }
     }
-    *band0 = lo;
-    *band1 = hi;
 }
 
 static ULONG vis_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
@@ -955,24 +1134,31 @@ static ULONG vis_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
         (msg->flags & MADF_DRAWOBJECT)) {
         /* Ganz: erstes Bild, neuer Farbton, oder MUI will alles (Fenster
          * aufgedeckt, Seite gewechselt). */
-        LONG b0, b1;
-
         render_bg(d, w, h);
-        render_line(d, w, h, &b0, &b1);
+        render_line(d, w, h);
         t1 = eclock(NULL);
         WritePixelArray(d->buf, 0, 0, (UWORD)(w * 4), _rp(obj),
                         (UWORD)l, (UWORD)t, (UWORD)w, (UWORD)h,
                         RECTFMT_ARGB);
     } else {
-        /* Nur der Streifen, in dem sich die Linie bewegt hat. */
-        LONG b0, b1;
+        /* Nur was sich bewegt hat, in acht senkrechten Streifen: eine
+         * einzelne hohe Spitze macht so nur ihren Streifen hoch, nicht
+         * die ganze Breite. */
+        LONG sl;
 
-        render_line(d, w, h, &b0, &b1);
+        render_line(d, w, h);
         t1 = eclock(NULL);
-        if (b1 >= b0) {
-            WritePixelArray(d->buf, 0, (UWORD)b0, (UWORD)(w * 4), _rp(obj),
-                            (UWORD)l, (UWORD)(t + b0), (UWORD)w,
-                            (UWORD)(b1 - b0 + 1), RECTFMT_ARGB);
+        for (sl = 0; sl < 8; sl++) {
+            LONG x0 = sl * w / 8, x1 = (sl + 1) * w / 8;
+
+            if (d->shi[sl] >= d->slo[sl] && x1 > x0) {
+                WritePixelArray(d->buf, (UWORD)x0, (UWORD)d->slo[sl],
+                                (UWORD)(w * 4), _rp(obj),
+                                (UWORD)(l + x0), (UWORD)(t + d->slo[sl]),
+                                (UWORD)(x1 - x0),
+                                (UWORD)(d->shi[sl] - d->slo[sl] + 1),
+                                RECTFMT_ARGB);
+            }
         }
     }
 #if VIS_MEASURE
@@ -1154,7 +1340,7 @@ static void ticker(struct VisData *d, Object *obj)
 #if VIS_MEASURE
 static void measure_note(const char *what)
 {
-    BPTR fh = Open((STRPTR)"T:AmiSubsonic-vis.log", MODE_READWRITE);
+    BPTR fh = Open((STRPTR)VIS_LOG, MODE_READWRITE);
 
     if (fh) {
         Seek(fh, 0, OFFSET_END);

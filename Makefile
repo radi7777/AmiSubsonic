@@ -81,6 +81,14 @@ AmiSubsonic: $(GUI_OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Der Visualizer rechnet je Bild eine FFT und zeichnet einige tausend
+# Bildpunkte - als einziger Teil dieses Programms lohnt sich hier
+# Tempo vor Groesse. Gemessen auf der PiStorm (22.9.2026, 300 Bilder):
+# Spektrum 1,09 -> 0,75 ms, Zeichnen 1,12 -> 0,97 ms je Bild. Die
+# Pruefsumme ueber alle 300 Bildpuffer ist mit -Os und -O3 dieselbe.
+visual.o: visual.c
+	$(CC) $(filter-out -Os,$(CFLAGS)) -O3 -fwrapv -c -o $@ $<
+
 # Eigene Datei, aber mit Helix' Flags - nur dort kennt man die Groessen.
 aacsize.o aacsize_sbr.o: %.o: %.c
 	$(CC) $(AAC_FLAGS) -c -o $@ $<
