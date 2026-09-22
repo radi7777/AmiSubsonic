@@ -50,6 +50,7 @@
 #include "albumgrid.h"
 #include "sidebar.h"
 #include "tabs.h"
+#include "visual.h"
 #include "player.h"
 #include "netjob.h"
 #include "local.h"
@@ -411,6 +412,10 @@ static Object *str_folder, *btn_folder;
 /* Fuer das Zykelfeld. MUSS ein Feld von Zeigern sein, das bis zum Ende
  * des Programms lebt - MUI kopiert die Liste nicht. */
 static const char *g_ahi_units[] = { "0", "1", "2", "3", NULL };
+static Object *cyc_vis;
+static const char *g_vis_rates[] = { "Off", "15 fps", "20 fps", "30 fps",
+                                     "60 fps", NULL };
+static const int   g_vis_fps[]   = { 0, 15, 20, 30, 60 };
 static Object *btn_mode, *btn_save, *btn_cancel;
 static Object *panel;
 
@@ -431,6 +436,7 @@ static Object *lst_queue, *ft_lyrics;
 static Object *player;
 static Object *grid, *sidebar, *pages, *txt_status;
 static Object *tabbar, *tabpages;
+static Object *visual;           /* dritter Reiter: VISUALIZER */
 
 /* Die beiden Seiten der Gruppe mit MUIA_Group_PageMode. */
 #define PAGE_HOME    0
@@ -597,6 +603,7 @@ static void tint_all(void)
     set(ft_lyrics, MUIA_TL_Colour, g_tint);
     set(grid,      MUIA_AG_Colour, g_tint);
     set(tabbar,    MUIA_Tb_Colour, g_tint);
+    set(visual,    MUIA_Vis_Colour, g_tint);
 }
 
 /* Zwischen Bildwand und Playeransicht umschalten.
@@ -2165,6 +2172,15 @@ static void prefs_open(void)
     set(str_user, MUIA_String_Contents, (ULONG)g_prefs.user);
     set(str_pass, MUIA_String_Contents, (ULONG)g_prefs.pass);
     set(cyc_ahi, MUIA_Cycle_Active, (ULONG)g_prefs.ahiunit);
+    {
+        ULONG i;
+
+        for (i = 0; i < 5; i++) {
+            if (g_vis_fps[i] == g_prefs.visfps) {
+                set(cyc_vis, MUIA_Cycle_Active, i);
+            }
+        }
+    }
     set(str_folder, MUIA_String_Contents, (ULONG)g_prefs.folder);
     set(chk_screen, MUIA_Selected, g_prefs.ownscreen ? TRUE : FALSE);
     mode_text();
@@ -2336,6 +2352,17 @@ static void prefs_apply(void)
 
         get(cyc_ahi, MUIA_Cycle_Active, &u);
         g_prefs.ahiunit = (int)u;
+    }
+    {
+        LONG u = 3;
+
+        /* Wirkt sofort - anders als die AHI-Unit. */
+        get(cyc_vis, MUIA_Cycle_Active, &u);
+        if (u < 0 || u > 4) {
+            u = 3;
+        }
+        g_prefs.visfps = g_vis_fps[u];
+        set(visual, MUIA_Vis_Fps, (ULONG)g_prefs.visfps);
     }
     {
         char old[192];
@@ -3331,7 +3358,8 @@ int main(void)
 {
     ULONG sigs = 0;
     ULONG id;
-    static const char *reg_titles[] = { "UP NEXT", "LYRICS", NULL };
+    static const char *reg_titles[] = { "UP NEXT", "LYRICS", "VISUALIZER",
+                                        NULL };
 
     list_init(&g_albums, sizeof(struct Album));
     list_init(&g_songs, sizeof(struct Song));
@@ -3388,6 +3416,18 @@ int main(void)
 
     if (!tb_init()) {
         printf("cannot create tab class\n");
+        sb_cleanup();
+        ag_cleanup();
+        panel_cleanup();
+        pl_cleanup();
+        tl_cleanup();
+        CloseLibrary(MUIMasterBase);
+        return 20;
+    }
+
+    if (!vis_init()) {
+        printf("cannot create visualizer class\n");
+        tb_cleanup();
         sb_cleanup();
         ag_cleanup();
         panel_cleanup();
@@ -3456,6 +3496,11 @@ int main(void)
 
     sidebar = SidebarObject,
         MUIA_Sb_Active, SB_HOME,
+        TAG_DONE);
+
+    visual = VisualObject,
+        MUIA_Vis_Colour, g_tint,
+        MUIA_Vis_Fps,    (ULONG)(g_have_prefs ? g_prefs.visfps : 30),
         TAG_DONE);
 
     tabbar = TabsObject,
@@ -3557,6 +3602,13 @@ int main(void)
                         MUIA_Frame,        MUIV_Frame_Button,
                         MUIA_Cycle_Entries, (ULONG)g_ahi_units,
                         TAG_DONE),
+                    MUIA_Group_Child, MUI_MakeObject(MUIO_Label,
+                        (ULONG)"Visualizer", 0),
+                    MUIA_Group_Child, cyc_vis = MUI_NewObject(MUIC_Cycle,
+                        MUIA_Frame,        MUIV_Frame_Button,
+                        MUIA_Cycle_Entries, (ULONG)g_vis_rates,
+                        MUIA_Cycle_Active, 3,
+                        TAG_DONE),
                     TAG_DONE),
 
                 MUIA_Group_Child, MUI_NewObject(MUIC_Group,
@@ -3644,6 +3696,7 @@ int main(void)
                                         MUIA_Group_ActivePage, 0,
                                         MUIA_Group_Child, lst_queue,
                                         MUIA_Group_Child, ft_lyrics,
+                                        MUIA_Group_Child, visual,
                                         TAG_DONE),
                                 TAG_DONE),
                             TAG_DONE),
@@ -3688,6 +3741,7 @@ int main(void)
     if (!app) {
         printf("cannot create application object\n");
         icon_close();
+        vis_cleanup();
         tb_cleanup();
         sb_cleanup();
         ag_cleanup();
@@ -4112,6 +4166,7 @@ int main(void)
     thumbs_free();
     MUI_DisposeObject(app);
     icon_close();
+    vis_cleanup();
     tb_cleanup();
     sb_cleanup();
     ag_cleanup();

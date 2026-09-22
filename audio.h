@@ -55,6 +55,12 @@ BOOL audio_track_done(void);        /* Titel ist zu Ende gelaufen */
 BOOL audio_error(void);             /* Strom war unlesbar (loescht sich) */
 void audio_clear_done(void);
 
+/* Visualizer: n Abtastwerte (mono, 16 Bit) an der Stelle, die gerade
+ * aus dem Lautsprecher kommt. FALSE, wenn nichts laeuft (Stop, Pause,
+ * Ende) - dann soll die Anzeige abklingen. Fasst keinen Speicher an,
+ * darf also jederzeit aus der Oberflaeche gerufen werden. */
+BOOL audio_vis_window(WORD *mono, LONG n);
+
 /* Dekodiert eine Datei vollstaendig, ohne sie auszugeben, und misst die
  * Zeit. Kein AHI, kein Netz - nur der Dekoder. */
 BOOL audio_probe_file(const char *path, struct AudioProbe *out);

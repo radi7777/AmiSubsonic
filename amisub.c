@@ -326,6 +326,12 @@ static int prefs_read_file(struct Prefs *p, const char *path)
             if (p->ahiunit < 0 || p->ahiunit > 3) {
                 p->ahiunit = 0;
             }
+        } else if (stricmp(line, "visfps") == 0) {
+            p->visfps = atoi(eq + 1);
+            if (p->visfps != 0 && p->visfps != 15 && p->visfps != 20 &&
+                p->visfps != 30 && p->visfps != 60) {
+                p->visfps = 30;
+            }
         } else if (stricmp(line, "ownscreen") == 0) {
             p->ownscreen = (atoi(eq + 1) != 0);
         } else if (stricmp(line, "screenmode") == 0) {
@@ -347,6 +353,7 @@ int prefs_load(struct Prefs *p)
 
     memset(p, 0, sizeof(*p));
     p->port = 4533;             /* Navidromes Vorgabe */
+    p->visfps = 30;             /* auch fuer alte Prefs ohne die Zeile */
 
     sprintf(path, "%s/%s", PREFS_DIR_ENV, PREFS_FILE);
     if (!prefs_read_file(p, path)) {
@@ -417,6 +424,9 @@ static int prefs_write_one(struct Prefs *p, const char *dir)
     FPrintf(fh, "; dahinter liegt, wird in den AHI-Voreinstellungen\n");
     FPrintf(fh, "; eingestellt, nicht hier.\n");
     FPrintf(fh, "ahiunit=%ld\n", (LONG)p->ahiunit);
+    FPrintf(fh, ";\n");
+    FPrintf(fh, "; Bilder je Sekunde des Visualizers: 0 (aus), 15, 20, 30, 60.\n");
+    FPrintf(fh, "visfps=%ld\n", (LONG)p->visfps);
     FPrintf(fh, ";\n");
     FPrintf(fh, "; Eigener Bildschirm statt Workbench (0/1), dazu die\n");
     FPrintf(fh, "; Modus-Kennung aus dem ASL-Requester und die Masse.\n");

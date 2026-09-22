@@ -66,6 +66,12 @@ struct Prefs {
      * ein - so macht es jedes andere Amiga-Programm auch. */
     int  ahiunit;
 
+    /* Bilder je Sekunde des Visualizers: 0 (aus), 15, 20, 30 oder 60. Er
+     * kostet je nach Maschine verschieden viel - auf der PiStorm bei 30
+     * rund 16 %, auf einem langsameren Amiga mehr. Fehlt die Zeile in
+     * den Prefs, gilt 30. */
+    int  visfps;
+
     /* Eigener Bildschirm statt Workbench. screenid ist die
      * Modus-Kennung aus dem ASL-Requester; 0 heisst "wie die
      * Workbench". Beides wirkt erst beim naechsten Start - ein Fenster

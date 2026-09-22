@@ -15,6 +15,8 @@
 #include <proto/dos.h>
 #include <dos/dostags.h>
 #include <devices/ahi.h>
+#include <devices/timer.h>
+#include <proto/timer.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +39,19 @@
 extern long aac_state_size(void);       /* aacsize.c */
 
 struct Library *MPEGABase = NULL;
+
+/* Nur fuer ReadEClock - die gemeinsame Uhr von Audioprozess und
+ * Visualizer. Geoeffnet in audio_start(), siehe dort. */
+struct Device *TimerBase = NULL;
+static struct timerequest g_eclock_req;
+
+/* Der hoerbare Puffer fuer den Visualizer - erklaert bei vis_publish(). */
+static WORD *volatile g_vis_buf = NULL;
+static volatile LONG  g_vis_frames = 0;
+static volatile LONG  g_vis_freq = 44100;
+static volatile ULONG g_vis_t0 = 0;
+static volatile ULONG g_vis_seq = 0;
+
 
 static char g_why[160] = "";
 
@@ -166,6 +181,15 @@ static void out_drain(struct AudioOut *o)
                 AbortIO((struct IORequest *)o->req[i]);
             }
         }
+        /* Abgebrochen heisst: ab sofort still. Der Visualizer zeigte
+         * sonst noch den abgebrochenen Puffer weiter, bis dessen Zeit
+         * rechnerisch um war - 4 bis 5 Bilder Nachlauf nach STOP (vom
+         * Anwender gesehen, 22.9.2026). */
+        if (o->abort) {
+            g_vis_seq++;
+            g_vis_buf = NULL;
+            g_vis_seq++;
+        }
         for (i = 0; i < 2; i++) {
             if (o->req[i]) {
                 WaitIO((struct IORequest *)o->req[i]);
@@ -181,6 +205,12 @@ static void out_free(struct AudioOut *o)
     LONG i;
 
     out_drain(o);
+
+    /* Der Visualizer liest aus diesen Puffern - vor dem Freigeben
+     * abmelden. */
+    g_vis_seq++;
+    g_vis_buf = NULL;
+    g_vis_seq++;
 
     if (o->devopen && o->req[0]) {
         CloseDevice((struct IORequest *)o->req[0]);
@@ -253,6 +283,84 @@ static BOOL out_open(struct AudioOut *o, LONG unit)
     return TRUE;
 }
 
+/* ------------------------------------------------------------------ */
+/* Was gerade zu hoeren ist - fuer den Visualizer                      */
+/* ------------------------------------------------------------------ */
+
+/* Ein Puffer spielt knapp 0,19 s, der Visualizer will 25 Bilder je
+ * Sekunde. Ein Schnappschuss je Puffer waere also viel zu grob. Statt
+ * dessen steht hier, WELCHER Puffer gerade laeuft und SEIT WANN (E-Clock);
+ * die Oberflaeche rechnet daraus die Stelle im Puffer und schneidet dort
+ * ihr Fenster aus. So ist die Anzeige genau so weit wie der Ton.
+ *
+ * g_vis_seq ist ungerade, solange geschrieben wird. Der Leser nimmt die
+ * Werte nur, wenn die Zahl vorher und nachher gleich und gerade ist -
+ * so gibt es keine halb alten, halb neuen Angaben, ohne Semaphore. */
+static void vis_publish(WORD *buf, LONG frames, LONG freq)
+{
+    struct EClockVal ev;
+
+    if (!TimerBase) {
+        return;
+    }
+    ReadEClock(&ev);
+    g_vis_seq++;
+    g_vis_buf = buf;
+    g_vis_frames = frames;
+    g_vis_freq = freq;
+    g_vis_t0 = ev.ev_lo;
+    g_vis_seq++;
+}
+
+BOOL audio_vis_window(WORD *mono, LONG n)
+{
+    struct EClockVal ev;
+    ULONG efreq, s1, dt;
+    WORD *buf;
+    LONG frames, freq, pos, start, i;
+    ULONG t0;
+
+    if (!TimerBase || n <= 0) {
+        return FALSE;
+    }
+    s1 = g_vis_seq;
+    buf = g_vis_buf;
+    frames = g_vis_frames;
+    freq = g_vis_freq;
+    t0 = g_vis_t0;
+    if ((s1 & 1) || s1 != g_vis_seq || !buf || frames < n || freq <= 0) {
+        return FALSE;                   /* gerade im Wechsel, oder nichts */
+    }
+
+    efreq = ReadEClock(&ev);
+    dt = ev.ev_lo - t0;                 /* vorzeichenlos: auch ueber den Ueberlauf */
+    if (efreq < 100 || dt > efreq) {
+        return FALSE;                   /* laenger als 1 s her: Pause, Ende */
+    }
+    /* In Hundertsteln rechnen, sonst laeuft dt * freq ueber 32 Bit. */
+    pos = (LONG)((dt * (ULONG)(freq / 100)) / (efreq / 100));
+    if (pos > frames + frames / 2) {
+        return FALSE;                   /* der Puffer ist laengst durch */
+    }
+
+    /* Das Fenster endet an der hoerbaren Stelle. Am Anfang eines Puffers
+     * reicht er nicht weit genug zurueck - dann eben ab Pufferanfang,
+     * das sind hoechstens n Abtastwerte Versatz (23 ms bei 1024). */
+    start = pos - n;
+    if (start < 0) {
+        start = 0;
+    }
+    if (start + n > frames) {
+        start = frames - n;
+    }
+    buf += start * 2;
+    for (i = 0; i < n; i++) {
+        mono[i] = (WORD)(((LONG)buf[0] + (LONG)buf[1]) >> 1);
+        buf += 2;
+    }
+    return TRUE;
+}
+
 /* Einen gefuellten Puffer losschicken und auf den vorigen warten. */
 static void out_send(struct AudioOut *o, LONG frames, LONG freq, LONG vol)
 {
@@ -277,6 +385,11 @@ static void out_send(struct AudioOut *o, LONG frames, LONG freq, LONG vol)
     if (o->linked) {
         WaitIO((struct IORequest *)prev);
     }
+    /* Ab JETZT ist dieser Puffer zu hoeren: der vorige ist durch, und
+     * AHI ist ueber ahir_Link nahtlos in diesen gewechselt. Er bleibt
+     * unangetastet, bis er ausgespielt ist - gefuellt wird inzwischen
+     * der andere. Der Visualizer darf ihn also lesen. */
+    vis_publish(o->buf[o->cur], frames, freq);
     o->linked = TRUE;
     o->cur ^= 1;
 }
@@ -1245,6 +1358,17 @@ BOOL audio_start(LONG unit)
         return FALSE;
     }
 
+    /* timer.device nur fuer ReadEClock, eine Uhr, die Audioprozess und
+     * Oberflaeche gemeinsam haben. Fehlt sie, gibt es eben keinen
+     * Visualizer - abspielen geht trotzdem. */
+    if (!TimerBase) {
+        memset(&g_eclock_req, 0, sizeof(g_eclock_req));
+        if (OpenDevice((STRPTR)TIMERNAME, UNIT_ECLOCK,
+                       (struct IORequest *)&g_eclock_req, 0) == 0) {
+            TimerBase = g_eclock_req.tr_node.io_Device;
+        }
+    }
+
     g_ap_unit = unit;
     g_ap_cmd = AC_NONE;
     g_ap_ready = 0;
@@ -1284,6 +1408,10 @@ void audio_shutdown(void)
     g_ap_cmd = AC_QUIT;
     Wait(SIGF_SINGLE);
     g_ap = NULL;
+    if (TimerBase) {
+        CloseDevice((struct IORequest *)&g_eclock_req);
+        TimerBase = NULL;
+    }
 }
 
 void audio_play(struct Ring *r, LONG base_ms)

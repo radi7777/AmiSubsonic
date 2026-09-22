@@ -61,7 +61,7 @@ AAC_FLAGS = -mcpu=$(CPU) -Os -fomit-frame-pointer -noixemul -MMD -MP -w -fwrapv 
 
 CLI_OBJS  = $(CORE_OBJS) cli.o $(AAC_OBJS) build/DoMethod.o
 GUI_OBJS  = $(CORE_OBJS) gui.o panel.o tracklist.o albumgrid.o sidebar.o \
-            tabs.o \
+            tabs.o visual.o \
             player.o netjob.o muistubs.o $(AAC_OBJS) \
             build/DoMethod.o build/DoSuperMethod.o
 
