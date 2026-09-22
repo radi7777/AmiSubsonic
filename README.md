@@ -5,6 +5,16 @@ and your **own MP3 files**. Version 0.2.
 
 ![AmiSubsonic on Workbench 3.2](docs/screenshot.png)
 
+| | |
+|---|---|
+| ![Album and queue](docs/upnext.png) | ![Lyrics](docs/lyrics.png) |
+| **UP NEXT** - the album, the playing track marked | **LYRICS** - from the server, or from lrclib.net |
+
+![Visualizer](docs/visualizer.png)
+
+**VISUALIZER** - spectrum of what you hear, coloured from the cover.
+The cover art in these shots is pixelated on purpose.
+
 [English](#english) · [Deutsch](#deutsch)
 
 ---
