@@ -38,7 +38,7 @@
 /* Die Version steht NUR hier und in gui.c ($VER). Sie geht als
  * User-Agent mit jeder Anfrage hinaus - in den Serverprotokollen sieht
  * man dann, welche Fassung unterwegs war. */
-#define SUB_VERSION     "0.3"
+#define SUB_VERSION     "0.4"
 
 struct Prefs {
     char host[128];             /* nur der Rechnername, ohne Schema */

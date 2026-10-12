@@ -1,7 +1,8 @@
 # AmiSubsonic
 
-A beautiful music player for the Amiga, for **Navidrome / Subsonic** servers
-and your **own MP3 files**. Version 0.3.
+A beautiful music player for the Amiga, for **Navidrome / Subsonic** servers,
+your **own MP3 files**, **audiobooks** from Audiobookshelf and **podcasts**.
+Version 0.4.
 
 ![AmiSubsonic on Workbench 3.2](docs/screenshot.png)
 
@@ -13,6 +14,12 @@ and your **own MP3 files**. Version 0.3.
 ![Visualizer](docs/visualizer.png)
 
 **VISUALIZER** - spectrum of what you hear, coloured from the cover.
+
+| | |
+|---|---|
+| ![Podcasts](docs/podcasts.png) | ![Audiobooks](docs/books.png) |
+| **PODCASTS** - episodes with date and state: new, where you stopped | **BOOKS** - audiobooks from Audiobookshelf, with your progress |
+
 The cover art in these shots is pixelated on purpose.
 
 [English](#english) · [Deutsch](#deutsch)
@@ -29,9 +36,17 @@ The cover art in these shots is pixelated on purpose.
 - Colours follow the cover: background and lists take on its main colour
 - Lyrics from the server, or from lrclib.net when the server has none
 - Internet radio stations of the server, with the current title (MP3 and AAC/HE-AAC streams)
+- **Audiobooks** from an [Audiobookshelf](https://www.audiobookshelf.org/)
+  server: cover wall with your progress, a click continues where you
+  stopped - also where you stopped on your phone. The position goes back
+  to the server every 30 s and on pause, stop and quit.
+- **Podcasts**, without any server: search the Apple podcast directory,
+  subscribe, see the newest 50 episodes of each show. Every episode
+  remembers where you stopped and whether you heard it.
 - Visualizer tab: spectrum of what you hear, coloured from the cover, with
   reflection; 15/20/30/60 fps or off, in Settings
-- Home, Albums, Tracks, Favorites, Radio, plus Folder/Albums and Folder/Tracks
+- Home, Albums, Tracks, Favorites, Radio, plus Folder/Albums and
+  Folder/Tracks, Audiobookshelf/Books and Podcasts
 - Own player: pause, seek within a track, queue, next/previous
 - Optional own screen
 
@@ -52,14 +67,22 @@ The cover art in these shots is pixelated on purpose.
 1. Copy the `AmiSubsonic` drawer to your hard disk (not RAM: - the cover
    cache lives next to the program, in `Cache`).
 2. Start AmiSubsonic and open **Settings**: server address, user name,
-   password. Optionally a folder with your own MP3 files and the AHI unit.
+   password. Optionally a folder with your own MP3 files, an Audiobookshelf
+   server (e.g. `http://192.168.1.10:13378`, user, password) and the AHI unit.
+3. Podcasts need no settings: **Podcasts > Add/Remove ...**, search, subscribe.
 
-Settings are stored in `ENVARC:AmiSubsonic/AmiSubsonic.prefs`. The password
-is stored there in plain text - the Subsonic protocol needs it for every
-request.
+Settings are stored in `ENVARC:AmiSubsonic/AmiSubsonic.prefs`. The passwords
+are stored there in plain text - both servers need them to log in.
+Subscribed podcasts and their positions live in the `Podcasts` drawer next
+to the program.
 
 ### Notes
 
+- Audiobooks and podcasts play MP3 only. M4B books, AAC/M4A podcast
+  episodes and video podcasts are not supported (Apple lists some shows
+  twice, as audio and as video - take the audio one).
+- Some podcasts are recorded at 32 or 48 kHz. AHI then converts to its
+  mixing frequency, which costs a little sound quality on Paula.
 - AAC radio is decoded with the Helix fixed-point decoder (ADTS streams,
   HE-AAC included; HE-AAC v2 plays in mono). Stations in other formats are
   greyed out once they have been tried.
@@ -113,9 +136,17 @@ Tested on an A500 with PiStorm (AmigaOS 3.2) and in WinUAE / Amiberry
 - Farben passen sich dem Cover an: Hintergrund und Listen übernehmen seine Hauptfarbe
 - Liedtexte vom Server oder von lrclib.net, wenn der Server keine hat
 - Internetradio-Sender des Servers mit dem laufenden Titel (MP3- und AAC/HE-AAC-Ströme)
+- **Hörbücher** von einem [Audiobookshelf](https://www.audiobookshelf.org/)-
+  Server: Bildwand mit dem Hörstand, ein Klick spielt dort weiter, wo du
+  aufgehört hast - auch wenn das am Handy war. Die Stelle geht alle 30 s und
+  bei Pause, Stop und Beenden an den Server zurück.
+- **Podcasts** ohne jeden Server: im Podcast-Verzeichnis von Apple suchen,
+  abonnieren, je Sendung die neuesten 50 Folgen. Jede Folge merkt sich, wo
+  du warst und ob du sie gehört hast.
 - Visualizer-Reiter: Spektrum des Gehörten, eingefärbt nach dem Cover, mit
   Spiegelung; 15/20/30/60 Bilder je Sekunde oder aus, in den Einstellungen
-- Home, Albums, Tracks, Favorites, Radio, dazu Folder/Albums und Folder/Tracks
+- Home, Albums, Tracks, Favorites, Radio, dazu Folder/Albums und
+  Folder/Tracks, Audiobookshelf/Books und Podcasts
 - Eigener Abspieler: Pause, Springen im Titel, Warteschlange, vor/zurück
 - Wahlweise eigener Bildschirm
 
@@ -137,14 +168,24 @@ Tested on an A500 with PiStorm (AmigaOS 3.2) and in WinUAE / Amiberry
 1. Die Schublade `AmiSubsonic` auf die Festplatte kopieren (nicht ins RAM:
    - der Cover-Cache liegt neben dem Programm, in `Cache`).
 2. AmiSubsonic starten und **Settings** öffnen: Serveradresse, Benutzername,
-   Passwort. Wahlweise ein Verzeichnis mit eigenen MP3-Dateien und die AHI-Unit.
+   Passwort. Wahlweise ein Verzeichnis mit eigenen MP3-Dateien, ein
+   Audiobookshelf-Server (z.B. `http://192.168.1.10:13378`, Benutzer,
+   Passwort) und die AHI-Unit.
+3. Podcasts brauchen keine Einstellung: **Podcasts > Add/Remove ...**,
+   suchen, abonnieren.
 
-Die Einstellungen liegen in `ENVARC:AmiSubsonic/AmiSubsonic.prefs`. Das
-Passwort steht dort im Klartext - das Subsonic-Protokoll braucht es bei
-jeder Anfrage.
+Die Einstellungen liegen in `ENVARC:AmiSubsonic/AmiSubsonic.prefs`. Die
+Passwörter stehen dort im Klartext - beide Server brauchen sie zur Anmeldung.
+Abonnierte Podcasts und ihre Stände liegen in der Schublade `Podcasts` neben
+dem Programm.
 
 ### Hinweise
 
+- Hörbücher und Podcasts spielen nur MP3. M4B-Hörbücher, AAC/M4A-Folgen und
+  Video-Podcasts gehen nicht (Apple führt manche Sendungen doppelt, als
+  Audio und als Video - die Audio-Fassung nehmen).
+- Manche Podcasts sind mit 32 oder 48 kHz aufgenommen. AHI rechnet dann auf
+  seine Mischfrequenz um, das kostet auf Paula etwas Klang.
 - AAC-Radio dekodiert der Helix-Festkommadekoder (ADTS-Ströme, auch
   HE-AAC; HE-AAC v2 spielt in Mono). Sender in anderen Formaten werden nach
   dem ersten Versuch grau.
