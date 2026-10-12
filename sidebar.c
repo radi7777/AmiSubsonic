@@ -67,6 +67,16 @@ static const struct Entry g_entries[] = {
     { "Audiobookshelf", E_HEAD, -1 },
     { "Books",       E_ITEM, SB_ABS_BOOKS },
     { "",            E_GAP,  -1 },
+
+    /* Podcasts, unabhaengig von jedem Server: abonniert wird ueber die
+     * Suche von Apple, gespielt direkt aus dem Feed. Eigener Scan-Knopf
+     * (Wunsch des Anwenders) - der allgemeine Scan laesst sie in Ruhe,
+     * weil das Auffrischen vieler Feeds dauert. */
+    { "Podcasts",    E_HEAD, -1 },
+    { "Subscriptions", E_ITEM, SB_POD_SUBS },
+    { "Add ...",     E_ITEM, SB_POD_ADD },
+    { "Scan",        E_ITEM, SB_POD_SCAN },
+    { "",            E_GAP,  -1 },
     { "Scan",        E_ITEM, SB_SCAN },
     { "Settings",    E_ITEM, SB_SETTINGS },
 };

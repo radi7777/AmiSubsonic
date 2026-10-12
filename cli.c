@@ -22,6 +22,7 @@
 #include "audio.h"
 #include "ring.h"
 #include "abs.h"
+#include "pod.h"
 
 /* aacdec.h kennt keinen 68k und bricht sonst mit #error ab. ARDUINO ist
  * dort nur ein leerer Plattformzweig - die Rechenroutinen stehen in
@@ -92,6 +93,15 @@ static const char *(*g_ferrstr)(void) = sub_last_error;
  * Laenge vorher keiner kennt. */
 static long g_fskip = 0;
 
+/* Dasselbe als ZEIT (Podcasts): die Bitrate ist vorher unbekannt und
+ * kommt aus dem ersten Rahmenkopf hinter dem Etikett. */
+static long g_fskip_ms = 0;
+
+/* Ab dieser Groesse wird ein ID3-Etikett nicht mehr durchgelesen,
+ * sondern per Range uebersprungen - Podcasts betten das Cover ein,
+ * gemessen bis 531 KB. */
+#define ID3_JUMP  65536
+
 /* Wird gerufen, solange der Fueller wartet (Ring voll) und nachdem die
  * Datei ganz im Ring ist, bis der Hauptprozess Schluss sagt - mit
  * final = TRUE ein letztes Mal. Dort schreibt Audiobookshelf die
@@ -106,6 +116,7 @@ static void filler(void)
     long off = 0;
     long waited = 0;            /* Ticks, die schon vergeblich vergingen */
     int  need_sync = 0;         /* nach einem Sprung: erst Rahmen suchen */
+    int  phase = 0;             /* 0 Etikett pruefen, 1 Einstieg, 2 Strom */
 
     chunk = AllocVec(FILL_CHUNK, MEMF_PUBLIC);
     if (!chunk) {
@@ -151,7 +162,7 @@ static void filler(void)
          * Die Laenge steht in vier "synchsafe" Bytes, also je sieben
          * nutzbaren Bits - das achte ist immer 0, damit im Etikett nie
          * ein MPEG-Synchronwort entstehen kann. */
-        if (off == 0) {
+        if (phase == 0 && off == 0) {
             UBYTE hdr[10];
             long got = 0;
 
@@ -171,6 +182,13 @@ static void filler(void)
                           |  (long)(hdr[9] & 0x7f);
 
                 g_fill_id3 = skip + 10;
+                if (skip > ID3_JUMP) {
+                    /* Gross: nicht mitlesen, dahinter neu ansetzen. */
+                    sub_stream_close(&st);
+                    off = skip + 10;
+                    phase = 1;
+                    continue;
+                }
                 while (skip > 0) {
                     long want = (skip > FILL_CHUNK) ? FILL_CHUNK : skip;
                     long n = sub_stream_read(&st, chunk, want);
@@ -180,22 +198,49 @@ static void filler(void)
                     }
                     skip -= n;
                 }
-            } else if (got > 0) {
+            } else if (got > 0 && g_fskip == 0 && g_fskip_ms == 0) {
                 ring_write(&g_ring, hdr, (ULONG)got);
             }
             off = st.pos;
             g_fill_bytes = off;
             g_t_id3 = ticks_now() - t0 - g_t_conn;
+            phase = 1;
+        }
 
-            /* Einstieg mitten in die Datei: Etikett ist vorbei, jetzt
-             * neu ansetzen. Eine zweite Verbindung, aber nur eine
-             * kurze - billiger, als bis zur Stelle mitzulesen. */
+        /* Einstieg mitten in die Datei: Etikett ist vorbei, jetzt neu
+         * ansetzen. Eine zweite Verbindung, aber nur eine kurze -
+         * billiger, als bis zur Stelle mitzulesen. */
+        if (phase == 1) {
+            phase = 2;
             if (g_fskip > 0) {
                 sub_stream_close(&st);
                 off += g_fskip;
                 g_fskip = 0;
                 need_sync = 4;      /* hoechstens vier Scheiben suchen */
                 continue;
+            }
+            if (g_fskip_ms > 0) {
+                /* Eine Scheibe lesen, darin den ersten echten Rahmen
+                 * suchen, seine Bitrate nehmen. Feste Bitrate
+                 * angenommen - bei allen gemessenen Podcasts so. */
+                long at = st.pos;
+                long n2 = sub_stream_read(&st, chunk, FILL_CHUNK);
+                LONG k = (n2 > 0) ? mp3_find_frame(chunk, n2) : -1;
+                LONG kbps = (k >= 0) ? mp3_frame_kbps(chunk + k) : 0;
+
+                if (kbps > 0) {
+                    sub_stream_close(&st);
+                    off = at + k + g_fskip_ms * kbps / 8;
+                    g_fskip_ms = 0;
+                    need_sync = 4;
+                    continue;
+                }
+                /* Kein Rahmen gefunden: von vorn spielen statt gar nicht. */
+                g_fskip_ms = 0;
+                if (n2 > 0) {
+                    ring_write(&g_ring, chunk, (ULONG)n2);
+                }
+                off = st.pos;
             }
         }
 
@@ -649,6 +694,7 @@ static void usage(void)
 "  ptest <titel-id> [ahi-unit]                 Audioprozess: Pause, Position\n"
 "  range <titel-id> [offset] [format] [kbps]   Einstieg mitten im Titel\n"
 "  abs ...                                     Audiobookshelf (Hoerbuecher)\n"
+"  pod ...                                     Podcasts\n"
 "\n"
 "\n"
 "Der Zugang steht in ENVARC:AmiSubsonic/AmiSubsonic.prefs.\n");
@@ -1213,6 +1259,315 @@ out:
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Podcasts                                                            */
+/* ------------------------------------------------------------------ */
+
+static char g_pod_url[POD_URL_LEN];
+
+static int pod_fopen(long off, struct SubStream *st)
+{
+    return sub_url_open(g_pod_url, NULL, off, st);
+}
+
+/* Gross genug fuer den Stapel ist eine PodFeed (rund 70 KB) nicht -
+ * also statisch. Im CLI gibt es nur den einen Hauptprozess, der sie
+ * anfasst. */
+static struct PodFeed g_pf;
+
+/* "3" ist die dritte Zeile aus "pod list". */
+static int pod_pick(const char *arg)
+{
+    struct SubList l;
+    int nr = atoi(arg), rc;
+
+    list_init(&l, sizeof(struct PodShow));
+    pod_list(&l);
+    if (nr < 1 || nr > l.count) {
+        printf("kein Podcast Nr. %d (es gibt %d)\n", nr, l.count);
+        list_free(&l);
+        return SUB_EAPI;
+    }
+    rc = pod_load(((struct PodShow *)list_get(&l, nr - 1))->id, &g_pf);
+    list_free(&l);
+    return rc;
+}
+
+static void ep_state(const struct PodEpisode *e, char *out)
+{
+    char t[16];
+
+    if (e->done) {
+        strcpy(out, "gehoert");
+    } else if (e->pos_ms > 0) {
+        duration_text((int)(e->pos_ms / 1000), t, sizeof(t));
+        sprintf(out, "bei %s", t);
+    } else {
+        strcpy(out, "neu");
+    }
+}
+
+static int pod_play(int epnr, long start_ms, LONG unit)
+{
+    struct PodEpisode *e;
+    struct Process *proc;
+    LONG last_save, last_print = 0;
+    BOOL quit = FALSE, natural = FALSE;
+    char t1[16], t2[16];
+
+    if (epnr < 1 || epnr > g_pf.count) {
+        printf("keine Folge Nr. %d\n", epnr);
+        return SUB_EAPI;
+    }
+    e = &g_pf.ep[epnr - 1];
+    if (start_ms < 0) {
+        start_ms = e->done ? 0 : e->pos_ms;
+    }
+    strncpy(g_pod_url, e->url, sizeof(g_pod_url) - 1);
+
+    /* Ab hier gehoert das Netz dem Fueller. */
+    sub_cleanup();
+
+    if (!ring_init(&g_ring, 1024UL * 1024UL)) {
+        printf("zu wenig Speicher fuer den Ringpuffer\n");
+        return SUB_EMEM;
+    }
+    if (!audio_start(unit)) {
+        printf("%s\n", audio_last_error());
+        ring_free(&g_ring);
+        return SUB_EMEM;
+    }
+    audio_set_volume(64);
+
+    g_fopen = pod_fopen;
+    g_ferrstr = sub_last_error;
+    g_fidle = NULL;
+    g_fskip = 0;
+    g_fskip_ms = start_ms;
+    ring_reset(&g_ring);
+    g_fill_done = 0;
+    g_fill_err[0] = '\0';
+    g_fill_reconnects = 0;
+    g_fill_id3 = 0;
+    g_fill_bytes = 0;
+
+    proc = CreateNewProcTags(NP_Entry,     (ULONG)filler,
+                             NP_Name,      (ULONG)"AmiSubsonic.fill",
+                             NP_StackSize, 65536,
+                             NP_Priority,  0,
+                             TAG_DONE);
+    if (!proc) {
+        printf("Fuellprozess laesst sich nicht starten\n");
+        audio_shutdown();
+        ring_free(&g_ring);
+        return SUB_EMEM;
+    }
+    while (ring_used(&g_ring) < 64UL * 1024UL && !g_ring.eof) {
+        if (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C) {
+            quit = TRUE;
+            break;
+        }
+        Delay(5);
+    }
+    if (g_fill_err[0]) {
+        printf("Fueller: %s\n", g_fill_err);
+        quit = TRUE;
+    }
+    if (!quit) {
+        hms(start_ms, t1);
+        printf("%s\n  ab %s, ID3 %ld B\n", e->title, t1, (long)g_fill_id3);
+        fflush(stdout);
+        audio_play(&g_ring, start_ms);
+        last_save = ticks_now();
+
+        for (;;) {
+            Delay(25);
+            if (audio_state() == AU_PLAYING) {
+                e->pos_ms = audio_pos_ms();
+            }
+            if (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C) {
+                audio_halt();
+                break;
+            }
+            if (audio_track_done()) {
+                natural = TRUE;
+                break;
+            }
+            if (audio_error()) {
+                printf("nicht abspielbar: %s\n", audio_last_error());
+                break;
+            }
+            /* Stand alle 30 s sichern - faellt der Amiga aus, fehlen
+             * hoechstens diese 30 s. Nur eine kleine Datei. */
+            if (ticks_now() - last_save >= 30 * 50 || ticks_now() < last_save) {
+                last_save = ticks_now();
+                pod_save_state(&g_pf);
+            }
+            if (ticks_now() - last_print >= 15 * 50 || ticks_now() < last_print) {
+                last_print = ticks_now();
+                hms(e->pos_ms, t1);
+                hms(e->dur_s * 1000L, t2);
+                printf("    %s / %s\n", t1, t2);
+                fflush(stdout);
+            }
+        }
+    }
+
+    g_ring.stop = TRUE;
+    while (!g_fill_done) {
+        Delay(2);
+    }
+    audio_shutdown();
+    ring_free(&g_ring);
+    g_fopen = nav_open;
+    g_ferrstr = sub_last_error;
+
+    /* Zu Ende gelaufen heisst gehoert; Wunsch des Anwenders: danach
+     * anhalten, nicht weiterschalten. */
+    if (natural) {
+        e->done = TRUE;
+        e->pos_ms = 0;
+    }
+    pod_save_state(&g_pf);
+    hms(e->pos_ms, t1);
+    printf("gesichert: %s%s\n", e->done ? "gehoert" : t1, "");
+    return SUB_OK;
+}
+
+/* pod search <text> | add <text> <nr> | list | eps <nr> |
+ * refresh [nr] | play <nr> <folge> [sek] | remove <nr> */
+static int cmd_pod(struct Prefs *p, int argc, char **argv)
+{
+    const char *sub = argc > 0 ? argv[0] : "";
+    char t1[16], st[32];
+    int rc = SUB_OK, i;
+
+    if (stricmp(sub, "search") == 0 && argc >= 2) {
+        struct SubList l;
+        LONG t0 = ticks_now();
+
+        list_init(&l, sizeof(struct PodShow));
+        rc = pod_search(argv[1], &l);
+        if (rc == SUB_OK) {
+            for (i = 0; i < l.count; i++) {
+                struct PodShow *p = (struct PodShow *)list_get(&l, i);
+
+                printf("%2d %-40.40s %.30s\n", i + 1, p->title, p->author);
+            }
+            printf("%d Treffer in %ld.%02ld s\n", l.count,
+                   (long)((ticks_now() - t0) / 50),
+                   (long)(((ticks_now() - t0) % 50) * 2));
+        }
+        list_free(&l);
+    } else if (stricmp(sub, "add") == 0 && argc >= 3) {
+        struct SubList l;
+        int nr = atoi(argv[2]);
+        BOOL changed;
+        LONG t0;
+
+        list_init(&l, sizeof(struct PodShow));
+        rc = pod_search(argv[1], &l);
+        if (rc == SUB_OK && (nr < 1 || nr > l.count)) {
+            printf("kein Treffer Nr. %d\n", nr);
+            rc = SUB_EAPI;
+        }
+        if (rc == SUB_OK) {
+            memset(&g_pf, 0, sizeof(g_pf));
+            g_pf.show = *(struct PodShow *)list_get(&l, nr - 1);
+            pod_key(g_pf.show.feed, g_pf.show.id);
+            printf("abonniere %s\n  %s\n", g_pf.show.title, g_pf.show.feed);
+            t0 = ticks_now();
+            rc = pod_refresh(&g_pf, &changed);
+            if (rc == SUB_OK) {
+                printf("%d Folgen, Feed gelesen in %ld.%02ld s\n", g_pf.count,
+                       (long)((ticks_now() - t0) / 50),
+                       (long)(((ticks_now() - t0) % 50) * 2));
+            }
+        }
+        list_free(&l);
+    } else if (stricmp(sub, "list") == 0) {
+        struct SubList l;
+
+        list_init(&l, sizeof(struct PodShow));
+        rc = pod_list(&l);
+        for (i = 0; i < l.count; i++) {
+            struct PodShow *p = (struct PodShow *)list_get(&l, i);
+
+            printf("%2d %-40.40s %2d neu von %d  [%s]\n", i + 1, p->title,
+                   p->nnew, p->count, p->id);
+        }
+        list_free(&l);
+    } else if (stricmp(sub, "eps") == 0 && argc >= 2) {
+        rc = pod_pick(argv[1]);
+        if (rc == SUB_OK) {
+            printf("%s - %s\n", g_pf.show.title, g_pf.show.author);
+            for (i = 0; i < g_pf.count; i++) {
+                struct PodEpisode *e = &g_pf.ep[i];
+
+                duration_text((int)e->dur_s, t1, sizeof(t1));
+                ep_state(e, st);
+                printf("%2d %-11s %7s %-12s %.48s\n", i + 1, e->date, t1, st,
+                       e->title);
+            }
+        }
+    } else if (stricmp(sub, "refresh") == 0) {
+        struct SubList l;
+        BOOL changed;
+
+        list_init(&l, sizeof(struct PodShow));
+        pod_list(&l);
+        for (i = 0; i < l.count; i++) {
+            struct PodShow *p = (struct PodShow *)list_get(&l, i);
+            LONG t0 = ticks_now();
+            int before;
+
+            if (argc >= 2 && atoi(argv[1]) != i + 1) {
+                continue;
+            }
+            pod_load(p->id, &g_pf);
+            before = g_pf.show.nnew;
+            rc = pod_refresh(&g_pf, &changed);
+            printf("%-40.40s %s, %ld.%02ld s, %d neu (vorher %d)\n",
+                   p->title,
+                   rc != SUB_OK ? pod_last_error()
+                                : (changed ? "aktualisiert" : "unveraendert (304)"),
+                   (long)((ticks_now() - t0) / 50),
+                   (long)(((ticks_now() - t0) % 50) * 2),
+                   g_pf.show.nnew, before);
+        }
+        list_free(&l);
+        rc = SUB_OK;
+    } else if (stricmp(sub, "play") == 0 && argc >= 3) {
+        rc = pod_pick(argv[1]);
+        if (rc == SUB_OK) {
+            rc = pod_play(atoi(argv[2]),
+                          argc >= 4 ? atol(argv[3]) * 1000L : -1L,
+                          (LONG)p->ahiunit);
+        }
+    } else if (stricmp(sub, "remove") == 0 && argc >= 2) {
+        rc = pod_pick(argv[1]);
+        if (rc == SUB_OK) {
+            pod_remove(g_pf.show.id);
+            printf("entfernt: %s\n", g_pf.show.title);
+        }
+    } else {
+        printf("pod search <text>              bei Apple suchen\n"
+               "pod add <text> <nr>            Treffer nr abonnieren\n"
+               "pod list                       Abos\n"
+               "pod eps <nr>                   Folgen eines Abos\n"
+               "pod refresh [nr]               Feeds neu holen\n"
+               "pod play <nr> <folge> [sek]    abspielen, Stand sichern\n"
+               "pod remove <nr>                Abo loeschen\n");
+        return 5;
+    }
+
+    if (rc != SUB_OK) {
+        printf("Fehler: %s\n", pod_last_error());
+        return 10;
+    }
+    return 0;
+}
+
 static int run(int argc, char **argv)
 {
     struct Prefs p;
@@ -1277,6 +1632,9 @@ static int run(int argc, char **argv)
      * Befehlen und mit eigenem Rueckgabewert. */
     if (stricmp(cmd, "abs") == 0) {
         return cmd_abs(&p, argc - 2, argv + 2);
+    }
+    if (stricmp(cmd, "pod") == 0) {
+        return cmd_pod(&p, argc - 2, argv + 2);
     }
 
     if (stricmp(cmd, "ping") == 0) {

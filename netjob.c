@@ -16,6 +16,7 @@
 #include "local.h"
 #include "amisub.h"
 #include "abs.h"
+#include "pod.h"
 #include "audio.h"
 
 /* Beide Prozesse sind derselbe Programmabzug und teilen sich damit auch
@@ -58,6 +59,19 @@ static char  g_st_msg[96];          /* was zuletzt geschah */
 /* Audiobookshelf: Datei des Buchs (g_st_id ist dann das Buch). */
 static char  g_st_ino[16];
 static long  g_st_skip = 0;         /* nach dem Etikett noch ueberspringen */
+
+/* Podcast: g_st_url ist dann eine Folge (mit Range), kein Sender. Der
+ * Einstieg kommt als ZEIT, die Bitrate steht erst im ersten Rahmen. */
+static BOOL  g_st_pod = FALSE;
+static long  g_st_skip_ms = 0;
+
+/* Wo der Strom steht: 0 Dateianfang (Etikett pruefen), 1 Einstieg
+ * anfahren, 2 laeuft. Ein Wiederaufsetzen nach Abriss bleibt bei 2. */
+static int   g_st_phase = 2;
+
+/* Ab hier wird ein Etikett nicht mitgelesen, sondern per Range
+ * uebersprungen: Podcasts betten ihr Cover ein, gemessen bis 531 KB. */
+#define ID3_JUMP  65536
 
 /* Nach einem Sprung mitten in die Datei: erst den Rahmenanfang suchen.
  * Vor dem ersten echten Rahmen stehen falsche Synchronwoerter, und
@@ -152,7 +166,9 @@ static volatile ULONG g_icy_seq = 0;
  * Synchronwort. mpega.library sucht den Anfang nur in den ersten
  * Kilobytes und gibt dann auf (gemessen: sie las 48 KB und meldete
  * "kein MPEG"). Also wird das Etikett uebersprungen. */
-static void stream_skip_id3(void)
+/* TRUE: das Etikett ist so gross, dass dahinter NEU verbunden werden
+ * soll - g_st_off steht dann schon dort. */
+static BOOL stream_skip_id3(void)
 {
     UBYTE hdr[10];
     long got = 0;
@@ -161,7 +177,7 @@ static void stream_skip_id3(void)
         long n = sub_stream_read(&g_st, hdr + got, 10 - got);
 
         if (n <= 0) {
-            return;
+            return FALSE;
         }
         got += n;
     }
@@ -171,6 +187,10 @@ static void stream_skip_id3(void)
                   | ((long)(hdr[8] & 0x7f) <<  7)
                   |  (long)(hdr[9] & 0x7f);
 
+        if (skip > ID3_JUMP) {
+            g_st_off = skip + 10;
+            return TRUE;
+        }
         while (skip > 0) {
             long want = (skip > ST_CHUNK) ? ST_CHUNK : skip;
             long n = sub_stream_read(&g_st, g_st_buf, want);
@@ -180,10 +200,11 @@ static void stream_skip_id3(void)
             }
             skip -= n;
         }
-    } else if (got > 0) {
+    } else if (got > 0 && g_st_skip == 0 && g_st_skip_ms == 0) {
         ring_write(g_st_ring, hdr, (ULONG)got);
     }
     g_st_off = g_st.pos;
+    return FALSE;
 }
 
 static void stream_close(void)
@@ -246,6 +267,9 @@ static void stream_begin(struct NetJob *j)
     g_st_ino[sizeof(g_st_ino) - 1] = '\0';
     g_st_skip = j->skip;
     g_st_sync = (j->offset > 0 || j->skip > 0) ? 4 : 0;
+    g_st_pod = j->pod;
+    g_st_skip_ms = j->pos_ms;
+    g_st_phase = (j->offset > 0) ? 2 : 0;
     g_st_on   = (g_st_ring != NULL);
     g_st_waited = 0;
     g_st_waited_s = 0;
@@ -546,12 +570,14 @@ static BOOL stream_slice(void)
         return FALSE;
     }
 
-    if (g_st_url[0]) {
+    if (g_st_url[0] && !g_st_pod) {
         return radio_slice();
     }
 
     if (!g_st_open) {
-        int rc = g_st_ino[0]
+        int rc = g_st_pod
+               ? sub_url_open(g_st_url, NULL, g_st_off, &g_st)
+               : g_st_ino[0]
                ? abs_open_file(g_prefs, g_st_id, g_st_ino, g_st_off, &g_st)
                : sub_stream_open(g_prefs, g_st_id, g_st_off, &g_st);
 
@@ -578,8 +604,15 @@ static BOOL stream_slice(void)
          * retrying for 4 s" weiter da, waehrend laengst Musik lief. */
         g_st_waited_s = 0;
         sprintf(g_st_msg, "offen ab %ld von %ld", g_st_off, g_st.total);
-        if (g_st_off == 0) {
-            stream_skip_id3();
+        if (g_st_phase == 0) {
+            g_st_phase = 1;
+            if (stream_skip_id3()) {
+                stream_close();         /* grosses Etikett: dahinter */
+                return TRUE;
+            }
+        }
+        if (g_st_phase == 1) {
+            g_st_phase = 2;
             /* Einstieg mitten in die Datei: jetzt, wo die Laenge des
              * Etiketts bekannt ist, an der Zielstelle neu verbinden. */
             if (g_st_skip > 0) {
@@ -587,6 +620,29 @@ static BOOL stream_slice(void)
                 g_st_off += g_st_skip;
                 g_st_skip = 0;
                 return TRUE;
+            }
+            /* Dasselbe als Zeit (Podcast): Bitrate aus dem ersten
+             * echten Rahmen. Feste Bitrate angenommen - bei allen
+             * gemessenen Podcasts so. */
+            if (g_st_skip_ms > 0) {
+                long at = g_st.pos;
+                long n2 = sub_stream_read(&g_st, g_st_buf, ST_CHUNK);
+                LONG k = (n2 > 0) ? mp3_find_frame(g_st_buf, n2) : -1;
+                LONG kbps = (k >= 0) ? mp3_frame_kbps(g_st_buf + k) : 0;
+
+                if (kbps > 0) {
+                    stream_close();
+                    g_st_off = at + k + g_st_skip_ms * kbps / 8;
+                    g_st_skip_ms = 0;
+                    g_st_sync = 4;
+                    return TRUE;
+                }
+                /* Kein Rahmen: von vorn statt gar nicht. */
+                g_st_skip_ms = 0;
+                if (n2 > 0) {
+                    ring_put_all(g_st_buf, n2);
+                }
+                g_st_off = g_st.pos;
             }
         }
     }
@@ -1015,6 +1071,21 @@ static void do_job(struct NetJob *j)
          * entscheidet, wo ein Cover liegt.
          *
          * "ab-..." ist ein Hoerbuch - dasselbe, nur vom anderen Server. */
+        if (strncmp(j->id, "pc-", 3) == 0) {
+            /* Podcast: das Bild hat eine eigene Adresse (j->url). */
+            struct PodShow ps;
+
+            memset(&ps, 0, sizeof(ps));
+            strncpy(ps.id, j->id + 3, sizeof(ps.id) - 1);
+            strncpy(ps.image, j->url, sizeof(ps.image) - 1);
+            j->rc = pod_cover_cached(g_prefs, &ps, j->path,
+                                     (int)sizeof(j->path));
+            if (j->rc != SUB_OK) {
+                strncpy(j->error, pod_last_error(), sizeof(j->error) - 1);
+                return;
+            }
+            break;
+        }
         if (strncmp(j->id, "ab-", 3) == 0) {
             j->rc = abs_cover_cached(g_prefs, j->id, j->size,
                                      j->path, (int)sizeof(j->path));
@@ -1045,6 +1116,26 @@ static void do_job(struct NetJob *j)
         }
         if (j->rc != SUB_OK) {
             strncpy(j->error, abs_last_error(), sizeof(j->error) - 1);
+            return;
+        }
+        break;
+    }
+
+    case NJ_POD_SEARCH:
+        j->rc = pod_search(j->title, j->out_list);
+        if (j->rc != SUB_OK) {
+            strncpy(j->error, pod_last_error(), sizeof(j->error) - 1);
+            return;
+        }
+        break;
+
+    case NJ_POD_REFRESH: {
+        BOOL changed = FALSE;
+
+        j->rc = pod_refresh(j->out_feed, &changed);
+        j->size = changed ? 1 : 0;
+        if (j->rc != SUB_OK) {
+            strncpy(j->error, pod_last_error(), sizeof(j->error) - 1);
             return;
         }
         break;

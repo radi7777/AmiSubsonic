@@ -3,6 +3,11 @@
 #include <exec/types.h>
 #include <proto/exec.h>
 #include <proto/graphics.h>
+
+/* Breite einer Zeitzelle. 34 Punkte reichten fuer "4:07", aber nicht
+ * fuer "1:34:45" - bei Musik fiel das nie auf, bei Podcasts (oft ueber
+ * eine Stunde) stand dort "1:34" (12.10.2026). */
+#define TIME_W  60
 #include <proto/intuition.h>
 #include <proto/utility.h>
 #include <proto/muimaster.h>
@@ -424,6 +429,12 @@ static void draw_center(Object *obj, struct PlData *d,
     if (d->bar_w > 300) {
         d->bar_w = 300;
     }
+    /* Die Zeitzellen sind breiter geworden (TIME_W) - der Balken gibt
+     * das ab, damit die Mittelgruppe nicht in die Textzeilen waechst. */
+    d->bar_w -= 2 * (TIME_W - 34);
+    if (d->bar_w < 60) {
+        d->bar_w = 60;
+    }
     d->bar_x = cx - d->bar_w / 2;
 
     /* Zeiten und Balken zeichnet dieselbe Funktion wie beim Auffrischen -
@@ -457,6 +468,7 @@ static void draw_progress(Object *obj, struct PlData *d, LONG fh)
 {
     char a[16], b[16];
     LONG done = 0;
+    LONG aw;
 
     if (d->bar_w <= 0) {
         return;
@@ -465,13 +477,20 @@ static void draw_progress(Object *obj, struct PlData *d, LONG fh)
     duration_text(d->pos, a, sizeof(a));
     duration_text(d->total > 0 ? d->total : 0, b, sizeof(b));
 
-    fill_rect(obj, d->bar_x - 36, d->bar_y - fh / 2, 34, fh, 0x00000000);
-    fill_rect(obj, d->bar_x + d->bar_w + 6, d->bar_y - fh / 2, 34, fh,
+    fill_rect(obj, d->bar_x - TIME_W - 2, d->bar_y - fh / 2, TIME_W, fh,
+              0x00000000);
+    fill_rect(obj, d->bar_x + d->bar_w + 6, d->bar_y - fh / 2, TIME_W, fh,
               0x00000000);
 
-    draw_text(obj, a, d->bar_x - 36, d->bar_y - fh / 2, 34,
+    /* Die linke Zeit rechtsbuendig an den Balken - sonst stuende "0:57"
+     * in der breiten Zelle verloren weit links davon. */
+    aw = TextLength(_rp(obj), (STRPTR)a, (UWORD)strlen(a));
+    if (aw > TIME_W) {
+        aw = TIME_W;
+    }
+    draw_text(obj, a, d->bar_x - 6 - aw, d->bar_y - fh / 2, aw,
               _pens(obj)[MPEN_HALFSHINE], FALSE);
-    draw_text(obj, b, d->bar_x + d->bar_w + 6, d->bar_y - fh / 2, 34,
+    draw_text(obj, b, d->bar_x + d->bar_w + 6, d->bar_y - fh / 2, TIME_W,
               _pens(obj)[MPEN_HALFSHINE], FALSE);
 
     if (d->total > 0 && d->pos > 0) {

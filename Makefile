@@ -43,7 +43,7 @@ CFLAGS  = -mcpu=$(CPU) -Os -fomit-frame-pointer -noixemul -MMD -MP \
 # unten als einzelnes Objekt heraus.
 LDFLAGS = -noixemul -s -lgcc
 
-CORE_OBJS = amisub.o md5.o cover.o audio.o ring.o local.o aacsize.o aacsize_sbr.o json.o abs.o
+CORE_OBJS = amisub.o md5.o cover.o audio.o ring.o local.o aacsize.o aacsize_sbr.o json.o abs.o pod.o
 
 # Helix AAC (RealNetworks, RPSL - siehe vendor/helix-aac/README.amiga).
 # Eigene Regel mit eigenen Flags: -DARDUINO waehlt dort die normale

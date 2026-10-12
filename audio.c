@@ -1500,6 +1500,23 @@ static LONG mp3_frame_len(const UBYTE *b)
     return 144L * br / sr + pad;
 }
 
+LONG mp3_frame_kbps(const UBYTE *b)
+{
+    LONG ver, layer, t;
+
+    if (mp3_frame_len(b) <= 0) {
+        return 0;
+    }
+    ver   = (b[1] >> 3) & 3;
+    layer = (b[1] >> 1) & 3;
+    if (ver == 3) {
+        t = 3 - layer;
+    } else {
+        t = (layer == 3) ? 3 : 4;
+    }
+    return g_br_tab[t][((b[2] >> 4) & 15) - 1];
+}
+
 LONG mp3_find_frame(const UBYTE *b, LONG n)
 {
     LONG i, len, len2;

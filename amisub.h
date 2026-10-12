@@ -151,6 +151,11 @@ struct Song {
      * BUCH ausrechnen - die geht an den Server zurueck. */
     char absitem[SUB_ID_LEN];
     long abs_start_ms;
+
+    /* Nur bei Podcast-Folgen: die Sendung (Kennung wie in pod.h). id ist
+     * dann der Schluessel der Folge; die Adresse steht im Feed, nicht
+     * hier - sie ist bis 512 Zeichen lang, und Song wird oft kopiert. */
+    char podshow[12];
 };
 
 /* Eine Radiostation, wie getInternetRadioStations sie liefert. Sie ist
@@ -218,6 +223,12 @@ struct SubStream {
     long  metaint;      /* ICY: Musikbytes zwischen zwei Titelbloecken */
     long  bitrate;      /* icy-br in kbps, 0 = unbekannt */
     int   hops;         /* wie oft weitergeleitet wurde */
+    /* Nur bei sub_url_open gefuellt (Podcasts): Status der Antwort
+     * (200, 206 oder 304 = nicht geaendert) und die Merkmale, mit denen
+     * man beim naechsten Mal "nur wenn geaendert" fragen kann. */
+    int   status;
+    char  etag[80];
+    char  lastmod[40];
 };
 
 /* Oeffnet stream.view ab Byte offset. format=raw, also OHNE Umkodieren -
@@ -235,6 +246,12 @@ void sub_stream_close(struct SubStream *st);
  * laufenden Titel - dann steckt alle st->metaint Bytes ein Textblock
  * im Strom, den der Leser herausschneiden MUSS. */
 int  sub_radio_open(const char *url, BOOL icy, struct SubStream *st);
+/* Beliebige http(s)-Adresse als Strom, mit Weiterleitungen (wie beim
+ * Radio), ab Byte offset (Range) und mit eigenen Kopfzeilen (hdrs, je
+ * mit "\r\n", oder NULL) - etwa If-None-Match fuer einen Feed. Bei 304
+ * ist die Verbindung schon zu und st->status sagt es. */
+int  sub_url_open(const char *url, const char *hdrs, long offset,
+                  struct SubStream *st);
 /* TRUE, wenn der Content-Type nach MP3 aussieht (oder fehlt). */
 BOOL sub_radio_is_mp3(const char *ctype);
 /* TRUE, wenn der Content-Type nach AAC im ADTS-Rahmen aussieht - das

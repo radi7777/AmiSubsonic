@@ -69,6 +69,11 @@ BOOL audio_vis_window(WORD *mono, LONG n);
  * steht. */
 LONG mp3_find_frame(const UBYTE *b, LONG n);
 
+/* Bitrate in kbit/s des Rahmens, dessen Kopf bei b steht, 0 = kein
+ * gueltiger Kopf. Bei fester Bitrate ergibt sich daraus die Byte-Stelle
+ * einer Zeit: kbit/s mal ms durch 8. */
+LONG mp3_frame_kbps(const UBYTE *b);
+
 /* Dekodiert eine Datei vollstaendig, ohne sie auszugeben, und misst die
  * Zeit. Kein AHI, kein Netz - nur der Dekoder. */
 BOOL audio_probe_file(const char *path, struct AudioProbe *out);

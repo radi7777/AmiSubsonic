@@ -55,6 +55,7 @@
 #include "netjob.h"
 #include "local.h"
 #include "abs.h"
+#include "pod.h"
 
 /* MUIA_Dtpic_Name steht nicht in den MUI-3.8-Headern - die Klasse kam
  * erst mit MUI 4. Das hier installierte muimaster.library 19.35 bringt
@@ -309,6 +310,39 @@ static BOOL  g_abs_sync_job = FALSE;
 static int   g_abs_ticks    = 0;
 #define ABS_SYNC_SECS  30
 
+/* PODCASTS. Die Abos als Bildwand wie die Buecher: g_pshows aus den
+ * Dateien unter PROGDIR:Podcasts, g_palbums dieselbe Reihe fuer die
+ * Bildwand, g_pthumbs die Miniaturen.
+ *
+ * Drei Feeds als FESTE Felder (je rund 35 KB), nie auf dem Stapel und
+ * nie geteilt:
+ *   g_pod_view  - die Sendung, die man ansieht (UP NEXT)
+ *   g_pod_play  - die Sendung, aus der gerade gespielt wird; nur sie
+ *                 schreibt ihren Stand
+ *   g_pod_job   - gehoert waehrend eines NJ_POD_REFRESH dem Netzprozess
+ * Getrennt, weil man beim Hoeren in einer anderen Sendung blaettern
+ * darf und ein Scan nebenher laeuft. */
+static struct SubList     g_pshows;
+static struct SubList     g_palbums;
+static struct AlbumThumb *g_pthumbs = NULL;
+static BOOL  g_pod_seen    = FALSE;
+static BOOL  g_want_pods   = FALSE;
+static int   g_pfill       = -1;
+static BOOL  g_pcover_job  = FALSE;
+static struct PodFeed g_pod_view;
+static struct PodFeed g_pod_play;
+static struct PodFeed g_pod_job;
+static BOOL  g_pod_job_busy = FALSE;   /* NJ_POD_REFRESH unterwegs */
+static int   g_pscan       = -1;       /* naechstes Abo beim Scan */
+static int   g_pscan_new   = 0;
+static BOOL  g_pod_subscribing = FALSE;
+static int   g_want_pshow  = -1;       /* Klick, der warten musste */
+
+/* Das Suchfenster: Ergebnisse vom Netzprozess, und die Zeilen, die die
+ * MUI-Liste anzeigt (MUI kopiert die Zeichenketten). */
+static struct SubList g_psearch;
+static BOOL  g_psearch_job = FALSE;
+
 static const char *view_type(int v)
 {
     /* "frequent" ist bei Subsonic die Liste nach Abspielhaeufigkeit. */
@@ -437,6 +471,9 @@ static Object *lst_radio;       /* die Ansicht "Radio" */
 static Object *lst_folder;      /* Folder/Tracks: eigene Dateien */
 static Object *grid_folder;     /* Folder/Albums: eigene Alben */
 static Object *grid_abs;        /* Audiobookshelf/Books */
+static Object *grid_pod;        /* Podcasts/Subscriptions */
+static Object *paddwin, *str_pterm, *btn_psearch, *lv_presults, *lst_presults;
+static Object *btn_psub, *txt_padd;
 
 /* Das Einstellfenster. Als einziges Fenster dieses Programms besteht es
  * aus MUI-BORDMITTELN - Stringfelder, Ankreuzfeld, Knoepfe. Das ist
@@ -487,6 +524,7 @@ static Object *visual;           /* dritter Reiter: VISUALIZER */
 #define PAGE_FOLDER  5          /* eigene Titel, Liste */
 #define PAGE_FALBUMS 6          /* eigene Alben, Bildwand */
 #define PAGE_ABS     7          /* Hoerbuecher, Bildwand */
+#define PAGE_POD     8          /* Podcasts, Bildwand */
 
 #define ID_QUIT        1
 #define ID_SIDEBAR     2
@@ -503,6 +541,9 @@ static Object *visual;           /* dritter Reiter: VISUALIZER */
 #define ID_FALBUM_PICK 15
 #define ID_FOLDER_PICK 16
 #define ID_ABOOK_PICK  17
+#define ID_POD_PICK    18
+#define ID_PADD_SEARCH 19
+#define ID_PADD_SUB    20
 #define ID_TAB         9
 #define ID_PLAYER     10
 
@@ -745,8 +786,10 @@ static void lyrics_request(struct Song *s)
 {
     /* Ein Hoerbuch hat keinen Liedtext - und weder Navidrome noch
      * lrclib kennen seine Dateien. Die Anfrage waere nur Netzlast. */
-    if (s && s->absitem[0]) {
-        strcpy(g_lyrics, "\n  (audiobook)");
+    if (s && (s->absitem[0] || s->podshow[0])) {
+        /* Auch Podcasts nicht: lrclib lehnt Folgen ueber einer Stunde
+         * sogar ab (HTTP 400, gemessen 12.10.2026). */
+        strcpy(g_lyrics, s->podshow[0] ? "\n  (podcast)" : "\n  (audiobook)");
         DoMethod(ft_lyrics, MUIM_TL_SetText, (ULONG)g_lyrics);
         return;
     }
@@ -1045,11 +1088,22 @@ static long abs_now_pos(void)
     return g_now.abs_start_ms + (long)audio_pos_ms();
 }
 
+static void pod_note(void);
+
 /* Die laufende Stelle zum Abgleich vormerken. Gerufen VOR allem, was
- * die Stelle veraendert (Stop, Wechsel) - danach waere sie weg. */
+ * die Stelle veraendert (Stop, Wechsel) - danach waere sie weg.
+ *
+ * Gilt fuer Hoerbuch UND Podcast: beim Podcast geht die Stelle nicht an
+ * einen Server, sondern gleich in die eigene Zustandsdatei. */
 static void abs_note(void)
 {
-    long pos = abs_now_pos();
+    long pos;
+
+    if (g_now_ok && g_now.podshow[0]) {
+        pod_note();
+        return;
+    }
+    pos = abs_now_pos();
 
     if (pos < 0) {
         return;
@@ -1132,6 +1186,25 @@ static int stream_start(int qidx, LONG start_ms)
             sizeof(g_sjobs[0].path) - 1);
     g_sjobs[g_sjob_cur].offset = (int)off;
     g_sjobs[g_sjob_cur].out_ring = &g_rings[g_ring_cur];
+
+    /* Podcast-Folge: die Adresse steht im Feed der laufenden Sendung,
+     * der Einstieg geht als Zeit (die Bitrate kennt erst der
+     * Netzprozess, aus dem ersten Rahmen). */
+    if (g_queue[qidx].podshow[0]) {
+        int i;
+
+        for (i = 0; i < g_pod_play.count; i++) {
+            if (strcmp(g_pod_play.ep[i].key, g_queue[qidx].id) == 0) {
+                strncpy(g_sjobs[g_sjob_cur].url, g_pod_play.ep[i].url,
+                        sizeof(g_sjobs[0].url) - 1);
+                break;
+            }
+        }
+        g_sjobs[g_sjob_cur].id[0] = '\0';
+        g_sjobs[g_sjob_cur].pod = TRUE;
+        g_sjobs[g_sjob_cur].pos_ms = start_ms;
+        g_sjobs[g_sjob_cur].offset = 0;
+    }
 
     /* Hoerbuch: Buch und Datei statt Titel-ID. Der Sprung geht ueber
      * skip, weil erst der Netzprozess die Laenge des ID3-Etiketts
@@ -3326,6 +3399,507 @@ static void abs_pick(int idx)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Podcasts                                                            */
+/* ------------------------------------------------------------------ */
+
+/* "3 new" bzw. "50 episodes" als dritte Zeile unter dem Cover. */
+static void pod_note_text(const struct PodShow *p, char *out)
+{
+    if (p->nnew > 0) {
+        sprintf(out, "%d new", p->nnew);
+    } else {
+        sprintf(out, "%d episodes", p->count);
+    }
+}
+
+static int pshow_cmp(const void *a, const void *b)
+{
+    return stricmp(((const struct PodShow *)a)->title,
+                   ((const struct PodShow *)b)->title);
+}
+
+/* Die Abos von der Platte lesen und als Bildwand zeigen. Kein Netz -
+ * aber malloc (list_add), also nur, wenn kein Auftrag laeuft. */
+static void pods_load(void)
+{
+    int i;
+
+    if (net_busy()) {
+        g_want_pods = TRUE;
+        return;
+    }
+    g_want_pods = FALSE;
+
+    DoMethod(grid_pod, MUIM_AG_SetList, (ULONG)NULL, (ULONG)NULL);
+    if (g_pthumbs) {
+        lthumbs_free(g_pthumbs, g_palbums.count);
+        g_pthumbs = NULL;
+    }
+    g_pfill = -1;
+    list_free(&g_palbums);
+    list_init(&g_palbums, sizeof(struct Album));
+    list_free(&g_pshows);
+    list_init(&g_pshows, sizeof(struct PodShow));
+
+    pod_list(&g_pshows);
+    if (g_pshows.count > 1) {
+        qsort(g_pshows.items, (size_t)g_pshows.count,
+              (size_t)g_pshows.itemsize, pshow_cmp);
+    }
+    for (i = 0; i < g_pshows.count; i++) {
+        struct PodShow *p = (struct PodShow *)list_get(&g_pshows, i);
+        struct Album *a = (struct Album *)list_add(&g_palbums);
+
+        if (!p || !a) {
+            break;
+        }
+        strncpy(a->id, p->id, sizeof(a->id) - 1);
+        strncpy(a->name, p->title, sizeof(a->name) - 1);
+        strncpy(a->artist, p->author, sizeof(a->artist) - 1);
+        pod_cover_id(p->id, a->coverart);
+        pod_note_text(p, a->note);
+    }
+    if (g_palbums.count > 0) {
+        g_pthumbs = calloc((size_t)g_palbums.count,
+                           sizeof(struct AlbumThumb));
+    }
+    DoMethod(grid_pod, MUIM_AG_SetList,
+             (ULONG)&g_palbums, (ULONG)g_pthumbs);
+    g_pfill = (g_palbums.count > 0 && g_pthumbs) ? 0 : -1;
+}
+
+static void pthumb_load(int idx, const char *path)
+{
+    struct CoverImage img;
+    UBYTE *rgb = NULL;
+    LONG w = 0, h = 0;
+
+    if (idx < 0 || idx >= g_palbums.count || !g_pthumbs) {
+        return;
+    }
+    if (cover_load(path, &img)) {
+        if (cover_scale_rgb(&img, AG_THUMB_SIZE, FALSE, &rgb, &w, &h)) {
+            g_pthumbs[idx].rgb = rgb;
+            g_pthumbs[idx].w   = w;
+            g_pthumbs[idx].h   = h;
+        }
+        cover_unload(&img);
+    }
+    DoMethod(grid_pod, MUIM_AG_Refresh);
+}
+
+/* Wie abs_thumbs_step(): aus dem Cache sofort, sonst EIN Abruf je
+ * Sekunde. Die Bildadresse geht im Auftrag mit (j->url). */
+static BOOL pod_thumbs_step(void)
+{
+    struct Album *a;
+    struct PodShow *p;
+    char path[256];
+
+    if (g_pfill < 0 || !g_pthumbs || g_pfill >= g_palbums.count
+            || g_pcover_job) {
+        return FALSE;
+    }
+    a = (struct Album *)list_get(&g_palbums, g_pfill);
+    p = (struct PodShow *)list_get(&g_pshows, g_pfill);
+    if (a && cache_have(&g_prefs, a->coverart)) {
+        cache_path(&g_prefs, a->coverart, path, sizeof(path));
+        pthumb_load(g_pfill, path);
+        if (++g_pfill >= g_palbums.count) {
+            g_pfill = -1;
+        }
+        return TRUE;
+    }
+    if (!a || !p || !g_fill_token || net_busy()) {
+        return FALSE;
+    }
+    if (!p->image[0]) {
+        if (++g_pfill >= g_palbums.count) {
+            g_pfill = -1;
+        }
+        return TRUE;
+    }
+    g_fill_token = FALSE;
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.op = NJ_COVER;
+    strcpy(g_job.id, a->coverart);
+    strncpy(g_job.url, p->image, sizeof(g_job.url) - 1);
+    if (net_submit(&g_job)) {
+        g_pcover_job = TRUE;
+    }
+    return FALSE;
+}
+
+static void pods_show(void)
+{
+    show_page(PAGE_POD);
+    if (!g_pod_seen) {
+        g_pod_seen = TRUE;
+        pods_load();
+    }
+    if (g_pshows.count == 0 && !g_want_pods) {
+        say("no podcasts yet - use Add ...");
+    }
+}
+
+/* Die Zeile einer Folge: Datum, Titel und der Stand. Neue Folgen
+ * bekommen einen Punkt vorn - so sieht man auf einen Blick, was man
+ * noch nicht kennt. */
+static void pod_row_title(const struct PodEpisode *e, char *out, int size)
+{
+    char t[16];
+    char buf[SUB_NAME_LEN + 48];
+
+    /* Der Stand steht VORN: hinten schneidet die Liste lange Titel ab,
+     * und dort war er nicht zu sehen (12.10.2026). */
+    if (e->done) {
+        sprintf(buf, "(played) %s  %s", e->date, e->title);
+    } else if (e->pos_ms > 0) {
+        duration_text((int)(e->pos_ms / 1000), t, sizeof(t));
+        sprintf(buf, "(at %s) %s  %s", t, e->date, e->title);
+    } else {
+        sprintf(buf, "\xb7 %s  %s", e->date, e->title);
+    }
+    strncpy(out, buf, size - 1);
+    out[size - 1] = '\0';
+}
+
+/* g_pod_view als UP NEXT. */
+static void pod_view_list(void)
+{
+    char cov[SUB_ID_LEN];
+    char path[256];
+    int i;
+
+    DoMethod(lst_queue, MUIM_TL_SetList, (ULONG)NULL);
+    list_free(&g_songs);
+    list_init(&g_songs, sizeof(struct Song));
+    pod_cover_id(g_pod_view.show.id, cov);
+
+    for (i = 0; i < g_pod_view.count; i++) {
+        struct PodEpisode *e = &g_pod_view.ep[i];
+        struct Song *sg = (struct Song *)list_add(&g_songs);
+
+        if (!sg) {
+            break;
+        }
+        pod_row_title(e, sg->title, sizeof(sg->title));
+        strncpy(sg->id, e->key, sizeof(sg->id) - 1);
+        strncpy(sg->artist, g_pod_view.show.title, sizeof(sg->artist) - 1);
+        strncpy(sg->album, g_pod_view.show.title, sizeof(sg->album) - 1);
+        strcpy(sg->suffix, "mp3");
+        strcpy(sg->coverart, cov);
+        strcpy(sg->podshow, g_pod_view.show.id);
+        sg->duration = (int)e->dur_s;
+        sg->track = i + 1;
+        sg->lalbum = -1;
+    }
+    DoMethod(lst_queue, MUIM_TL_SetList, (ULONG)&g_songs);
+    g_cur_album[0] = '\0';
+
+    set(panel, MUIA_Panel_Title,  (ULONG)g_pod_view.show.title);
+    set(panel, MUIA_Panel_Artist, (ULONG)g_pod_view.show.author);
+    set(panel, MUIA_Panel_Album,  (ULONG)"Podcast");
+    if (cache_have(&g_prefs, cov)) {
+        cache_path(&g_prefs, cov, path, sizeof(path));
+        strncpy(g_coverpath, path, sizeof(g_coverpath) - 1);
+        g_coverpath[sizeof(g_coverpath) - 1] = '\0';
+        cover_ready(g_coverpath);
+    }
+    mark_playing();
+    if (g_playing >= 0) {
+        set(lst_queue, MUIA_TL_Active, g_playing);
+    }
+}
+
+/* Eine Sendung oeffnen. Ist es die, die gerade laeuft, gilt deren Stand
+ * (er ist neuer als die Datei, die nur alle 30 s geschrieben wird). */
+static void pod_open_id(const char *id)
+{
+    char msg[64];
+
+    show_page(PAGE_PLAYER);
+    if (strcmp(id, g_pod_play.show.id) == 0 && g_pod_play.count > 0) {
+        g_pod_view = g_pod_play;
+    } else if (pod_load(id, &g_pod_view) != SUB_OK) {
+        say(pod_last_error());
+        return;
+    }
+    pod_view_list();
+    sprintf(msg, "%d episodes, %d new", g_pod_view.count,
+            g_pod_view.show.nnew);
+    say(msg);
+}
+
+static void pod_open(int idx)
+{
+    struct PodShow *p = (struct PodShow *)list_get(&g_pshows, idx);
+
+    if (!p) {
+        return;
+    }
+    /* g_songs neu belegen ist malloc - nicht waehrend eines Auftrags. */
+    if (net_busy()) {
+        show_page(PAGE_PLAYER);
+        g_want_pshow = idx;
+        say("just a moment ...");
+        return;
+    }
+    g_want_pshow = -1;
+    pod_open_id(p->id);
+}
+
+/* Die laufende Folge in g_pod_play, oder NULL. */
+static struct PodEpisode *pod_now_ep(void)
+{
+    int i;
+
+    if (!g_now_ok || !g_now.podshow[0]
+            || strcmp(g_now.podshow, g_pod_play.show.id) != 0) {
+        return NULL;
+    }
+    for (i = 0; i < g_pod_play.count; i++) {
+        if (strcmp(g_pod_play.ep[i].key, g_now.id) == 0) {
+            return &g_pod_play.ep[i];
+        }
+    }
+    return NULL;
+}
+
+/* Den Stand einer Folge auch in der sichtbaren Liste nachziehen - an Ort
+ * und Stelle, ohne malloc. */
+static void pod_view_update(const struct PodEpisode *e)
+{
+    int i;
+
+    if (strcmp(g_pod_view.show.id, g_pod_play.show.id) != 0) {
+        return;
+    }
+    for (i = 0; i < g_pod_view.count; i++) {
+        if (strcmp(g_pod_view.ep[i].key, e->key) == 0) {
+            g_pod_view.ep[i].pos_ms = e->pos_ms;
+            g_pod_view.ep[i].done = e->done;
+        }
+    }
+    for (i = 0; i < g_songs.count; i++) {
+        struct Song *sg = (struct Song *)list_get(&g_songs, i);
+
+        if (sg && strcmp(sg->podshow, g_pod_play.show.id) == 0
+                && strcmp(sg->id, e->key) == 0) {
+            pod_row_title(e, sg->title, sizeof(sg->title));
+            MUI_Redraw(lst_queue, MADF_DRAWOBJECT);
+            break;
+        }
+    }
+}
+
+/* Den Stand der laufenden Folge sichern - auf die eigene Platte, kein
+ * Netz noetig. Gerufen alle 30 s, bei Pause, Stop, Wechsel und am Ende. */
+static void pod_note(void)
+{
+    struct PodEpisode *e = pod_now_ep();
+
+    if (!e || audio_state() == AU_STOPPED) {
+        return;
+    }
+    e->pos_ms = (long)audio_pos_ms();
+    pod_save_state(&g_pod_play);
+    pod_view_update(e);
+}
+
+/* Die Folge ist zu Ende gelaufen: gehoert. Danach wird angehalten, nicht
+ * weitergeschaltet (Wunsch des Anwenders). */
+static void pod_finished(void)
+{
+    struct PodEpisode *e = pod_now_ep();
+
+    if (!e) {
+        return;
+    }
+    e->done = TRUE;
+    e->pos_ms = 0;
+    pod_save_state(&g_pod_play);
+    pod_view_update(e);
+}
+
+/* Doppelklick auf eine Folge: an der gemerkten Stelle weiter. */
+static void pod_play_index(int idx)
+{
+    struct PodEpisode *e;
+
+    if (idx < 0 || idx >= g_pod_view.count) {
+        return;
+    }
+    abs_note();                     /* was bis eben lief, sichern */
+    g_pod_play = g_pod_view;
+    e = &g_pod_play.ep[idx];
+    queue_from_songs();
+    play_queue_at(idx, (LONG)(e->done ? 0 : e->pos_ms));
+}
+
+/* Scan unter Podcasts: alle Feeds nacheinander auffrischen, hoechstens
+ * einer je Sekunde (pod_scan_step im Sekundentakt). */
+static void pods_scan(void)
+{
+    if (g_pscan >= 0) {
+        say("podcast scan is already running");
+        return;
+    }
+    if (!g_pod_seen) {
+        g_pod_seen = TRUE;
+        pods_load();
+    }
+    if (g_pshows.count == 0) {
+        say("no podcasts yet - use Add ...");
+        return;
+    }
+    g_pscan = 0;
+    g_pscan_new = 0;
+}
+
+static void pod_scan_step(void)
+{
+    struct PodShow *p;
+    char msg[96];
+
+    if (g_pscan < 0 || g_pod_job_busy || net_busy()) {
+        return;
+    }
+    if (g_pscan >= g_pshows.count) {
+        sprintf(msg, "podcasts checked - %d new episodes", g_pscan_new);
+        say(msg);
+        g_pscan = -1;
+        return;
+    }
+    p = (struct PodShow *)list_get(&g_pshows, g_pscan);
+    if (!p || pod_load(p->id, &g_pod_job) != SUB_OK) {
+        g_pscan++;
+        return;
+    }
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.op = NJ_POD_REFRESH;
+    g_job.out_feed = &g_pod_job;
+    if (net_submit(&g_job)) {
+        g_pod_job_busy = TRUE;
+        sprintf(msg, "checking %d/%d: %.50s", g_pscan + 1, g_pshows.count,
+                p->title);
+        say(msg);
+    }
+}
+
+/* Ein Feed ist aufgefrischt (Scan) oder neu abonniert. */
+static void pod_refresh_done(struct NetJob *j)
+{
+    char msg[160];
+
+    g_pod_job_busy = FALSE;
+    if (g_pod_subscribing) {
+        g_pod_subscribing = FALSE;
+        sprintf(msg, "subscribed: %.80s (%d episodes)",
+                g_pod_job.show.title, g_pod_job.count);
+        set(txt_padd, MUIA_Text_Contents, (ULONG)msg);
+        say(msg);
+        g_pod_seen = TRUE;
+        pods_load();
+        return;
+    }
+    if (g_pscan >= 0 && g_pscan < g_pshows.count) {
+        struct PodShow *p = (struct PodShow *)list_get(&g_pshows, g_pscan);
+        struct Album *a = (struct Album *)list_get(&g_palbums, g_pscan);
+
+        if (p && j->size) {
+            if (g_pod_job.show.nnew > p->nnew) {
+                g_pscan_new += g_pod_job.show.nnew - p->nnew;
+            }
+            p->nnew = g_pod_job.show.nnew;
+            p->count = g_pod_job.count;
+            if (a) {
+                pod_note_text(p, a->note);
+                DoMethod(grid_pod, MUIM_AG_Refresh);
+            }
+        }
+        g_pscan++;
+    }
+}
+
+/* Suchfenster: suchen. */
+static void padd_search(void)
+{
+    STRPTR t = NULL;
+
+    get(str_pterm, MUIA_String_Contents, &t);
+    if (!t || !*t) {
+        set(txt_padd, MUIA_Text_Contents, (ULONG)"type a name first");
+        return;
+    }
+    if (net_busy()) {
+        set(txt_padd, MUIA_Text_Contents,
+            (ULONG)"busy - try again in a moment");
+        return;
+    }
+    DoMethod(lst_presults, MUIM_List_Clear);
+    list_free(&g_psearch);
+    list_init(&g_psearch, sizeof(struct PodShow));
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.op = NJ_POD_SEARCH;
+    strncpy(g_job.title, (const char *)t, sizeof(g_job.title) - 1);
+    g_job.out_list = &g_psearch;
+    if (net_submit(&g_job)) {
+        g_psearch_job = TRUE;
+        set(txt_padd, MUIA_Text_Contents, (ULONG)"searching ...");
+    }
+}
+
+static void padd_results(void)
+{
+    char line[SUB_NAME_LEN + SUB_ARTIST_LEN + 8];
+    char msg[48];
+    int i;
+
+    g_psearch_job = FALSE;
+    for (i = 0; i < g_psearch.count; i++) {
+        struct PodShow *p = (struct PodShow *)list_get(&g_psearch, i);
+
+        sprintf(line, "%s  -  %s", p->title, p->author);
+        /* MUI kopiert die Zeile (ConstructHook_String). */
+        DoMethod(lst_presults, MUIM_List_InsertSingle, (ULONG)line,
+                 MUIV_List_Insert_Bottom);
+    }
+    sprintf(msg, "%d found", g_psearch.count);
+    set(txt_padd, MUIA_Text_Contents, (ULONG)msg);
+}
+
+/* Suchfenster: den gewaehlten Treffer abonnieren. */
+static void padd_subscribe(void)
+{
+    LONG n = -1;
+    struct PodShow *p;
+
+    get(lst_presults, MUIA_List_Active, &n);
+    p = (n >= 0) ? (struct PodShow *)list_get(&g_psearch, (int)n) : NULL;
+    if (!p) {
+        set(txt_padd, MUIA_Text_Contents, (ULONG)"select a podcast first");
+        return;
+    }
+    if (net_busy() || g_pod_job_busy) {
+        set(txt_padd, MUIA_Text_Contents,
+            (ULONG)"busy - try again in a moment");
+        return;
+    }
+    memset(&g_pod_job, 0, sizeof(g_pod_job));
+    g_pod_job.show = *p;
+    pod_key(g_pod_job.show.feed, g_pod_job.show.id);
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.op = NJ_POD_REFRESH;
+    g_job.out_feed = &g_pod_job;
+    if (net_submit(&g_job)) {
+        g_pod_job_busy = TRUE;
+        g_pod_subscribing = TRUE;
+        set(txt_padd, MUIA_Text_Contents, (ULONG)"subscribing ...");
+    }
+}
+
 /* Auf eine Ansicht der Bildwand umschalten.
  *
  * Ist sie schon einmal geholt worden, steht sie sofort da - Liste und
@@ -3536,6 +4110,12 @@ static void wants_step(void)
     if (g_want_abooks && !net_busy()) {
         abs_books_request();
     }
+    if (g_want_pods && !net_busy()) {
+        pods_load();
+    }
+    if (g_want_pshow >= 0 && !net_busy()) {
+        pod_open(g_want_pshow);
+    }
     abs_sync_step();
 
     /* Dasselbe fuer einen Ansichtswechsel, der auf das Netz warten
@@ -3572,6 +4152,39 @@ static void job_done(struct NetJob *j)
             g_acover_job = FALSE;
             if (g_afill >= 0 && ++g_afill >= g_abalbums.count) {
                 g_afill = -1;
+            }
+            return;
+        }
+        if (j->op == NJ_COVER && g_pcover_job) {
+            g_pcover_job = FALSE;
+            if (g_pfill >= 0 && ++g_pfill >= g_palbums.count) {
+                g_pfill = -1;
+            }
+            return;
+        }
+        if (j->op == NJ_POD_SEARCH) {
+            char msg[120];
+
+            g_psearch_job = FALSE;
+            sprintf(msg, "search failed: %.90s", j->error);
+            set(txt_padd, MUIA_Text_Contents, (ULONG)msg);
+            return;
+        }
+        if (j->op == NJ_POD_REFRESH) {
+            char msg[160];
+
+            g_pod_job_busy = FALSE;
+            if (g_pod_subscribing) {
+                g_pod_subscribing = FALSE;
+                sprintf(msg, "cannot subscribe: %.120s", j->error);
+                set(txt_padd, MUIA_Text_Contents, (ULONG)msg);
+                return;
+            }
+            /* Scan: dieser Feed nicht, weiter mit dem naechsten. */
+            sprintf(msg, "%.40s: %.100s", g_pod_job.show.title, j->error);
+            say(msg);
+            if (g_pscan >= 0) {
+                g_pscan++;
             }
             return;
         }
@@ -3670,6 +4283,14 @@ static void job_done(struct NetJob *j)
         g_abs_sync_job = FALSE;
         break;
 
+    case NJ_POD_SEARCH:
+        padd_results();
+        break;
+
+    case NJ_POD_REFRESH:
+        pod_refresh_done(j);
+        break;
+
     case NJ_TRACKS:
         tracks_fill();
         break;
@@ -3704,6 +4325,31 @@ static void job_done(struct NetJob *j)
                     radio_cover_show();
                 }
                 g_rfill++;
+            }
+        } else if (g_pcover_job) {
+            /* Ein Podcastcover fuer die Bildwand. */
+            g_pcover_job = FALSE;
+            pthumb_load(g_pfill, j->path);
+            if (g_pfill >= 0 && ++g_pfill >= g_palbums.count) {
+                g_pfill = -1;
+            }
+            /* Kam es spaeter als das Oeffnen der Sendung, jetzt auch in
+             * die Flaeche und - falls sie laeuft - in die Leiste. */
+            {
+                char cov[SUB_ID_LEN];
+
+                pod_cover_id(g_pod_view.show.id, cov);
+                if (g_page == PAGE_PLAYER && strcmp(cov, j->id) == 0) {
+                    strncpy(g_coverpath, j->path, sizeof(g_coverpath) - 1);
+                    g_coverpath[sizeof(g_coverpath) - 1] = '\0';
+                    cover_ready(g_coverpath);
+                }
+                if (g_now_ok && g_now.podshow[0] && !g_now_cover[0]
+                        && strcmp(g_now.coverart, j->id) == 0) {
+                    strncpy(g_now_cover, j->path, sizeof(g_now_cover) - 1);
+                    g_now_cover[sizeof(g_now_cover) - 1] = '\0';
+                    set(player, MUIA_Pl_Cover, (ULONG)g_now_cover);
+                }
             }
         } else if (g_acover_job) {
             /* Ein Buchcover fuer die Bildwand. */
@@ -3854,6 +4500,14 @@ static void tick(void)
         } else {
             say("station not reachable");
         }
+    } else if (audio_track_done() && g_now_ok && g_now.podshow[0]) {
+        /* Podcast: Folge gehoert, dann ANHALTEN - nicht zur naechsten
+         * (Wunsch des Anwenders, 12.10.2026). */
+        audio_clear_done();
+        pod_finished();
+        g_expect_play = FALSE;
+        set(player, MUIA_Pl_Playing, FALSE);
+        say("episode finished");
     } else if (audio_track_done()) {
         audio_clear_done();
         if (g_qpos + 1 < g_qcount) {
@@ -3872,13 +4526,15 @@ static void tick(void)
     /* Hoerbuch: alle 30 s die Stelle an den Server. Nur waehrend es
      * spielt - in der Pause aendert sie sich nicht, und die Pause hat
      * sie schon gemeldet. */
-    if (audio_state() == AU_PLAYING && abs_now_pos() >= 0) {
+    if (audio_state() == AU_PLAYING
+            && (abs_now_pos() >= 0 || (g_now_ok && g_now.podshow[0]))) {
         if (++g_abs_ticks >= ABS_SYNC_SECS) {
             g_abs_ticks = 0;
             abs_note();
         }
     }
     abs_sync_step();
+    pod_scan_step();
 
     /* Wenn das Netz weg ist, soll das nicht stumm bleiben - aber die
      * Meldung muss auch wieder VERSCHWINDEN, sobald es weitergeht.
@@ -3929,6 +4585,17 @@ static void now_goto(void)
         return;
     }
     if (!g_now_ok) {
+        return;
+    }
+
+    if (g_now.podshow[0]) {
+        /* Podcast: die Sendung zeigen, aus der gespielt wird. */
+        if (net_busy()) {
+            show_page(PAGE_PLAYER);
+            say("just a moment ...");
+            return;
+        }
+        pod_open_id(g_now.podshow);
         return;
     }
 
@@ -4036,6 +4703,9 @@ int main(void)
     list_init(&g_abooks, sizeof(struct AbsBook));
     list_init(&g_abalbums, sizeof(struct Album));
     list_init(&g_abs_tracks, sizeof(struct AbsTrack));
+    list_init(&g_pshows, sizeof(struct PodShow));
+    list_init(&g_palbums, sizeof(struct Album));
+    list_init(&g_psearch, sizeof(struct PodShow));
 
     MUIMasterBase = OpenLibrary(MUIMASTER_NAME, MUIMASTER_VMIN);
     if (!MUIMasterBase) {
@@ -4156,6 +4826,11 @@ int main(void)
     grid_abs = AlbumGridObject,
         MUIA_AG_Colour, g_tint,
         MUIA_AG_Title,  (ULONG)"Books",
+        TAG_DONE);
+
+    grid_pod = AlbumGridObject,
+        MUIA_AG_Colour, g_tint,
+        MUIA_AG_Title,  (ULONG)"Podcasts",
         TAG_DONE);
 
     lst_favs = TrackListObject,
@@ -4351,6 +5026,46 @@ int main(void)
                 TAG_DONE),
             TAG_DONE),
 
+        /* Podcast suchen und abonnieren. MUI-Bordmittel wie Settings:
+         * ein Suchfeld, eine Trefferliste, ein Knopf. Gesucht wird bei
+         * Apple (pod_search), im Netzprozess. */
+        MUIA_Application_Window, paddwin = MUI_NewObject(MUIC_Window,
+            MUIA_Window_Title,  "AmiSubsonic - Add podcast",
+            MUIA_Window_ID,     0x41535041UL,   /* 'ASPA' */
+            MUIA_Window_PublicScreen, (ULONG)g_pubname,
+            MUIA_Window_Width,  520,
+            MUIA_Window_Height, 340,
+            MUIA_Window_RootObject, MUI_NewObject(MUIC_Group,
+                MUIA_Group_Child, MUI_NewObject(MUIC_Group,
+                    MUIA_Group_Horiz, TRUE,
+                    MUIA_Group_Child, str_pterm = MUI_NewObject(MUIC_String,
+                        MUIA_Frame,         MUIV_Frame_String,
+                        MUIA_String_MaxLen, 100,
+                        TAG_DONE),
+                    MUIA_Group_Child, btn_psearch =
+                        MUI_MakeObject(MUIO_Button, (ULONG)"Search"),
+                    TAG_DONE),
+                MUIA_Group_Child, lv_presults = MUI_NewObject(MUIC_Listview,
+                    MUIA_Listview_List, lst_presults =
+                        MUI_NewObject(MUIC_List,
+                            MUIA_Frame, MUIV_Frame_InputList,
+                            MUIA_List_ConstructHook,
+                                MUIV_List_ConstructHook_String,
+                            MUIA_List_DestructHook,
+                                MUIV_List_DestructHook_String,
+                            TAG_DONE),
+                    TAG_DONE),
+                MUIA_Group_Child, MUI_NewObject(MUIC_Group,
+                    MUIA_Group_Horiz, TRUE,
+                    MUIA_Group_Child, btn_psub =
+                        MUI_MakeObject(MUIO_Button, (ULONG)"Subscribe"),
+                    MUIA_Group_Child, txt_padd = MUI_NewObject(MUIC_Text,
+                        MUIA_Text_Contents, (ULONG)"search the Apple podcast directory",
+                        TAG_DONE),
+                    TAG_DONE),
+                TAG_DONE),
+            TAG_DONE),
+
         MUIA_Application_Window, win = MUI_NewObject(MUIC_Window,
             MUIA_Window_Title,  "AmiSubsonic",
             MUIA_Window_ID,     0x41535542UL,   /* 'ASUB' */
@@ -4431,6 +5146,9 @@ int main(void)
 
                         /* Seite 7: die Hoerbuecher als Bildwand. */
                         MUIA_Group_Child, grid_abs,
+
+                        /* Seite 8: die Podcast-Abos als Bildwand. */
+                        MUIA_Group_Child, grid_pod,
                         TAG_DONE),
                     TAG_DONE),
 
@@ -4482,6 +5200,21 @@ int main(void)
              app, 2, MUIM_Application_ReturnID, ID_FALBUM_PICK);
     DoMethod(grid_abs, MUIM_Notify, MUIA_AG_Click, TRUE,
              app, 2, MUIM_Application_ReturnID, ID_ABOOK_PICK);
+    DoMethod(grid_pod, MUIM_Notify, MUIA_AG_Click, TRUE,
+             app, 2, MUIM_Application_ReturnID, ID_POD_PICK);
+
+    /* Das Suchfenster. Return im Suchfeld sucht wie der Knopf, ein
+     * Doppelklick auf einen Treffer abonniert wie "Subscribe". */
+    DoMethod(paddwin, MUIM_Notify, MUIA_Window_CloseRequest, TRUE,
+             paddwin, 3, MUIM_Set, MUIA_Window_Open, FALSE);
+    DoMethod(btn_psearch, MUIM_Notify, MUIA_Pressed, FALSE,
+             app, 2, MUIM_Application_ReturnID, ID_PADD_SEARCH);
+    DoMethod(str_pterm, MUIM_Notify, MUIA_String_Acknowledge, MUIV_EveryTime,
+             app, 2, MUIM_Application_ReturnID, ID_PADD_SEARCH);
+    DoMethod(btn_psub, MUIM_Notify, MUIA_Pressed, FALSE,
+             app, 2, MUIM_Application_ReturnID, ID_PADD_SUB);
+    DoMethod(lv_presults, MUIM_Notify, MUIA_Listview_DoubleClick, TRUE,
+             app, 2, MUIM_Application_ReturnID, ID_PADD_SUB);
     DoMethod(lst_queue, MUIM_Notify, MUIA_TL_DoubleClick, TRUE,
              app, 2, MUIM_Application_ReturnID, ID_SONG_PICK);
     DoMethod(lst_tracks, MUIM_Notify, MUIA_TL_DoubleClick, TRUE,
@@ -4598,6 +5331,20 @@ int main(void)
                 g_sb_home = which;
                 abs_books_show();
                 break;
+            case SB_POD_SUBS:
+                g_sb_home = which;
+                pods_show();
+                break;
+            case SB_POD_ADD:
+                /* Ein Fenster, kein Seitenwechsel - wie Settings. */
+                set(paddwin, MUIA_Window_Open, TRUE);
+                set(paddwin, MUIA_Window_ActiveObject, (ULONG)str_pterm);
+                set(sidebar, MUIA_Sb_Active, g_sb_home);
+                break;
+            case SB_POD_SCAN:
+                pods_scan();
+                set(sidebar, MUIA_Sb_Active, g_sb_home);
+                break;
             case SB_SCAN:
                 /* Kein Seitenwechsel - die Markierung bleibt, wo sie
                  * war, wie bei Settings. */
@@ -4613,6 +5360,24 @@ int main(void)
             }
             break;
         }
+
+        case ID_POD_PICK: {
+            LONG n = -1;
+
+            get(grid_pod, MUIA_AG_Active, &n);
+            if (n >= 0) {
+                pod_open((int)n);
+            }
+            break;
+        }
+
+        case ID_PADD_SEARCH:
+            padd_search();
+            break;
+
+        case ID_PADD_SUB:
+            padd_subscribe();
+            break;
 
         case ID_ABOOK_PICK: {
             LONG n = -1;
@@ -4725,8 +5490,13 @@ int main(void)
 
         case ID_SONG_PICK: {
             LONG n = -1;
+            struct Song *first = (struct Song *)list_get(&g_songs, 0);
+
             get(lst_queue, MUIA_TL_Active, &n);
-            if (n >= 0) {
+            if (n >= 0 && first && first->podshow[0]) {
+                /* Eine Folge: an der gemerkten Stelle weiter. */
+                pod_play_index((int)n);
+            } else if (n >= 0) {
                 play_index((int)n);
             }
             break;
@@ -4866,7 +5636,7 @@ int main(void)
          * Signal anliegt - ohne zu warten. Liegt keines an, geht es
          * sofort mit dem naechsten Bild weiter. */
         if (track_covers_step() || radio_covers_step() || thumbs_step()
-                || lthumbs_step() || abs_thumbs_step()) {
+                || lthumbs_step() || abs_thumbs_step() || pod_thumbs_step()) {
             ULONG have = SetSignal(0, 0) & (g_tsig | net_signal());
 
             if (!have) {
@@ -4972,6 +5742,9 @@ int main(void)
     list_free(&g_abooks);
     list_free(&g_abalbums);
     list_free(&g_abs_tracks);
+    list_free(&g_pshows);
+    list_free(&g_palbums);
+    list_free(&g_psearch);
     /* Kein sub_cleanup() hier - bsdsocket und AmiSSL gehoeren dem
      * Netzprozess und werden dort abgeraeumt. */
     return 0;

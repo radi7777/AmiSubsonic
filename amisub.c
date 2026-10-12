@@ -2027,6 +2027,8 @@ int sub_stream_url(struct Prefs *p, const char *songid, char *out, int outsize)
  * braucht. Ein Titel hat leicht 10 MB - die passen auf einem Amiga zwar
  * ins Fast-RAM, aber warten muesste man trotzdem, und beim Umschalten
  * waere alles umsonst geholt. */
+static long radio_read_head(struct Conn *c, char *head, long size);
+
 int sub_stream_open(struct Prefs *p, const char *songid, long offset,
                     struct SubStream *st)
 {
@@ -2039,9 +2041,9 @@ int sub_stream_open(struct Prefs *p, const char *songid, long offset,
     char encid[96];
     char req[1400];
     char head[1500];
-    long n, sent, total, got = 0;
+    long n, sent, total;
     BOOL used_cache = FALSE;
-    int rc, status = 0, rounds = 0;
+    int rc, status = 0;
     char *hdrend;
 
     memset(st, 0, sizeof(*st));
@@ -2151,35 +2153,9 @@ int sub_stream_open(struct Prefs *p, const char *songid, long offset,
      * Kopf hinaus schon da ist, in st gemerkt... - einfacher ist es, nur
      * bis zum Kopfende zu lesen und den Rest beim ersten Lesen zu
      * bekommen. Dafuer lesen wir hier in kleinen Schritten. */
-    while (got < (long)sizeof(head) - 1 && rounds++ < 4000) {
-        n = conn_recv(&c, head + got, 1);
-        if (n > 0) {
-            got += n;
-            head[got] = '\0';
-            if (got >= 4 && strcmp(head + got - 4, "\r\n\r\n") == 0) {
-                break;
-            }
-            continue;
-        }
-        if (c.ssl) {
-            int err = SSL_get_error(c.ssl, (int)n);
-
-            if (err == SSL_ERROR_ZERO_RETURN) {
-                break;
-            }
-            if (ssl_retry(&c, (int)n) == 1) {
-                continue;
-            }
-            break;
-        }
-        if (n < 0 && Errno() == SUB_EWOULDBLOCK) {
-            /* Warten statt drehen - siehe sub_stream_read(). */
-            if (sock_wait(c.sock, FALSE, SUB_IO_SECS) > 0) {
-                continue;
-            }
-        }
-        break;
-    }
+    /* Dieselbe Leseschleife wie bei Sendern und Podcasts - sie liest den
+     * Kopf auch dann ganz, wenn er nicht in head passt. */
+    radio_read_head(&c, head, sizeof(head));
 
     if (sscanf(head, "HTTP/%*d.%*d %d", &status) != 1) {
         conn_close(&c);
@@ -2291,7 +2267,9 @@ void sub_stream_close(struct SubStream *st)
  * (streams.80s80s.de -> regiocast.streamabc.net). Die Weiterleitung
  * muss also verfolgt werden, jedes Mal mit eigenem Handschlag und
  * eigenem SNI-Namen. */
-#define RADIO_HOPS 5
+/* Podcasts leiten ueber Werbe- und Zaehldienste weiter (podtrac,
+ * adswizz ...): gemessen bis 3 Spruenge, Reserve bis 8. */
+#define RADIO_HOPS 8
 
 /* "https://rechner:port/pfad" zerlegen. Eine Weiterleitung darf auch
  * nur einen Pfad nennen ("/stream") - dann bleiben Rechner, Port und
@@ -2373,22 +2351,38 @@ static BOOL head_field(const char *head, const char *name,
 
 /* Den Kopf bis zur Leerzeile lesen, byteweise: was danach kommt, ist
  * schon Musik und darf nicht verloren gehen. */
+/* Der Kopf wird GANZ gelesen, auch wenn er nicht in head passt: was
+ * nicht hineinpasst, wird verworfen, aber erst die Leerzeile beendet ihn.
+ * Vorher hoerte das Lesen bei vollem Puffer auf, und der Rest des Kopfs
+ * ging als Inhalt durch - Apples Bildserver schickt ueber 1,5 KB
+ * Kopfzeilen, und vor jedem Podcastcover standen 207 Bytes davon. Kein
+ * Datatype erkannte das Bild mehr (gemessen 12.10.2026). Was gebraucht
+ * wird (Status, Location, Content-Type), steht vorn. */
 static long radio_read_head(struct Conn *c, char *head, long size)
 {
     long got = 0, n;
-    int rounds = 0;
+    long rounds = 0;
+    char ch;
+    char last[4] = { 0, 0, 0, 0 };
 
     head[0] = '\0';
-    while (got < size - 1 && rounds++ < 4000) {
-        n = conn_recv(c, head + got, 1);
+    while (rounds++ < 32000) {
+        n = conn_recv(c, &ch, 1);
         if (n > 0) {
-            got += n;
-            head[got] = '\0';
-            if (got >= 4 && strcmp(head + got - 4, "\r\n\r\n") == 0) {
+            if (got < size - 1) {
+                head[got++] = ch;
+                head[got] = '\0';
+            }
+            last[0] = last[1];
+            last[1] = last[2];
+            last[2] = last[3];
+            last[3] = ch;
+            if (last[0] == '\r' && last[1] == '\n' &&
+                last[2] == '\r' && last[3] == '\n') {
                 break;
             }
             /* Manche Icecast-Abkoemmlinge enden nur mit \n\n. */
-            if (got >= 2 && strcmp(head + got - 2, "\n\n") == 0) {
+            if (last[2] == '\n' && last[3] == '\n') {
                 break;
             }
             continue;
@@ -2463,13 +2457,31 @@ static int radio_connect(const char *host, int port, BOOL https,
     return rc;
 }
 
+static int url_open(const char *url, BOOL icy, const char *hdrs,
+                    long offset, struct SubStream *st);
+
 int sub_radio_open(const char *url, BOOL icy, struct SubStream *st)
+{
+    return url_open(url, icy, NULL, 0, st);
+}
+
+int sub_url_open(const char *url, const char *hdrs, long offset,
+                 struct SubStream *st)
+{
+    return url_open(url, FALSE, hdrs, offset, st);
+}
+
+/* Der gemeinsame Weg fuer Sender und Podcasts: Adresse zerlegen,
+ * verbinden, Weiterleitungen folgen. Beim Podcast kommen Range und
+ * eigene Kopfzeilen dazu - und 206 bzw. 304 sind dort keine Fehler. */
+static int url_open(const char *url, BOOL icy, const char *hdrs,
+                    long offset, struct SubStream *st)
 {
     struct Conn c;
     char host[128];
     char path[768];
-    char req[1100];
-    char head[1500];
+    char req[1500];
+    char head[3000];
     char loc[768];
     char val[64];
     int port = 80;
@@ -2510,9 +2522,15 @@ int sub_radio_open(const char *url, BOOL icy, struct SubStream *st)
                 "User-Agent: %s/" SUB_VERSION "\r\n"
                 "Accept: */*\r\n"
                 "%s"
-                "Connection: close\r\n"
-                "\r\n",
+                "Connection: close\r\n",
                 SUB_CLIENT, icy ? "Icy-MetaData: 1\r\n" : "");
+        if (offset > 0) {
+            sprintf(req + strlen(req), "Range: bytes=%ld-\r\n", offset);
+        }
+        if (hdrs && strlen(hdrs) + strlen(req) < sizeof(req) - 4) {
+            strcat(req, hdrs);
+        }
+        strcat(req, "\r\n");
 
         total = (long)strlen(req);
         sent = 0;
@@ -2549,12 +2567,26 @@ int sub_radio_open(const char *url, BOOL icy, struct SubStream *st)
             st->hops++;
             continue;
         }
-        if (status != 200) {
+        st->status = status;
+        g_http_status = status;
+        if (status == 304) {
+            /* Nicht geaendert - es kommt kein Rumpf. */
+            conn_close(&c);
+            return SUB_OK;
+        }
+        if (status != 200 && status != 206) {
             char msg[96];
 
-            sprintf(msg, "station refused, HTTP %d", status);
+            sprintf(msg, "%s refused, HTTP %d", icy ? "station" : "server",
+                    status);
             conn_close(&c);
             return fail(SUB_EHTTP, msg);
+        }
+        if (head_field(head, "etag", val, sizeof(val))) {
+            copy_field(st->etag, sizeof(st->etag), val);
+        }
+        if (head_field(head, "last-modified", val, sizeof(val))) {
+            copy_field(st->lastmod, sizeof(st->lastmod), val);
         }
 
         /* Am Inhaltstyp haengt, welcher Dekoder zustaendig ist:
@@ -2572,9 +2604,22 @@ int sub_radio_open(const char *url, BOOL icy, struct SubStream *st)
         st->sock = c.sock;
         st->ssl  = c.ssl;
         st->total = 0;              /* ein Sender hat kein Ende */
+        st->pos  = 0;
+        if (status == 206 &&
+            head_field(head, "content-range", val, sizeof(val))) {
+            char *slash = strchr(val, '/');
+
+            st->pos = offset;
+            if (slash) {
+                st->total = atol(slash + 1);
+            }
+        } else if (!icy &&
+                   head_field(head, "content-length", val, sizeof(val))) {
+            st->total = atol(val);
+        }
         return SUB_OK;
     }
-    return fail(SUB_EHTTP, "station: too many redirects");
+    return fail(SUB_EHTTP, "too many redirects");
 }
 
 /* Ob der Inhaltstyp nach MP3 aussieht. Ohne Angabe wird es versucht -

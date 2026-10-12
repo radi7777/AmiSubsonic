@@ -69,8 +69,14 @@ enum {
                          * und die FRISCHE Position (pos_ms) - auf einem
                          * anderen Geraet kann seit der Buecherliste
                          * weitergehoert worden sein */
-    NJ_ABS_SYNC         /* Position zurueckschreiben (id, pos_ms, dur_ms) */
+    NJ_ABS_SYNC,        /* Position zurueckschreiben (id, pos_ms, dur_ms) */
+
+    /* Podcasts. */
+    NJ_POD_SEARCH,      /* bei Apple suchen (title, out_list: PodShow) */
+    NJ_POD_REFRESH      /* Feed holen (out_feed), size = 1: neu */
 };
+
+struct PodFeed;
 
 struct NetJob {
     struct Message msg;
@@ -103,6 +109,11 @@ struct NetJob {
     char  ino[16];
     long  skip;
     long  pos_ms, dur_ms;
+
+    /* Podcast: NJ_STREAM mit url und pod = TRUE spielt eine Folge (mit
+     * Range); der Einstieg steht als Zeit in pos_ms. */
+    BOOL  pod;
+    struct PodFeed *out_feed;   /* NJ_POD_REFRESH */
 
     /* Ausgaben. Die Strukturen gehoeren dem Auftraggeber; der
      * Arbeitsprozess fuellt sie und fasst sie danach nicht mehr an. */

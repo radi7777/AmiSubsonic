@@ -40,6 +40,10 @@
 #define SB_SETTINGS       8
 /* Hoerbuecher (Audiobookshelf), als Bildwand. */
 #define SB_ABS_BOOKS      9
+/* Podcasts: Bildwand der Abos, Suchfenster, Feeds auffrischen. */
+#define SB_POD_SUBS      10
+#define SB_POD_ADD       11
+#define SB_POD_SCAN      12
 
 /* Kein Eintrag markiert. Die Playeransicht ist kein Punkt der
  * Gliederung - waehrend sie offen ist, soll die Leiste nicht behaupten,
