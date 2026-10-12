@@ -3122,6 +3122,25 @@ static void folder_show(void)
     }
 }
 
+/* Scan unter Folder: nur den eigenen Ordner neu durchsuchen. Der Scan
+ * unter Navidrome macht das mit, frischt aber auch den Server auf - wer
+ * nur neue Dateien eingespielt hat, braucht das nicht. Kein
+ * Seitenwechsel; die Ansicht, die man gerade sieht, fuellt sich neu. */
+static void folder_rescan(void)
+{
+    if (!g_prefs.folder[0]) {
+        say("no folder set - see Settings");
+        return;
+    }
+    if (net_busy()) {
+        say("still busy with another request");
+        return;
+    }
+    g_local_seen = TRUE;
+    g_want_falbums = TRUE;
+    folder_request();
+}
+
 static void tracks_show(void)
 {
     show_page(PAGE_TRACKS);
@@ -5487,6 +5506,10 @@ int main(void)
                 break;
             case SB_POD_SCAN:
                 pods_scan();
+                set(sidebar, MUIA_Sb_Active, g_sb_home);
+                break;
+            case SB_FOLDER_SCAN:
+                folder_rescan();
                 set(sidebar, MUIA_Sb_Active, g_sb_home);
                 break;
             case SB_SCAN:

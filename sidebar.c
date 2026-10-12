@@ -32,6 +32,12 @@ static struct MUI_CustomClass *g_mcc = NULL;
 #define E_ITEM   1      /* waehlbar */
 #define E_DEAD   2      /* gezeichnet, aber noch ohne Funktion */
 #define E_GAP    3      /* Leerzeile */
+#define E_LINE   4      /* halbe Leerzeile mit Trennlinie */
+
+/* Farbe der Ueberschriften und der Trennlinie - ein helles Blau, passend
+ * zum Auswahlbalken. Die Linie geht ueber FillPixelArray (RGB direkt),
+ * die Schrift ueber einen Stift (headpen). */
+#define SB_HEAD_RGB  0x007FA8FFUL
 
 struct Entry {
     const char *label;
@@ -62,6 +68,10 @@ static const struct Entry g_entries[] = {
     { "Folder",      E_HEAD, -1 },
     { "Albums",      E_ITEM, SB_FOLDER_ALBUMS },
     { "Tracks",      E_ITEM, SB_FOLDER_TRACKS },
+    /* Eigener Scan nur fuer den Ordner - der unter Navidrome macht
+     * beides, aber wer nur neue Dateien eingespielt hat, soll nicht den
+     * Server mit auffrischen muessen (Wunsch des Anwenders). */
+    { "Scan",        E_ITEM, SB_FOLDER_SCAN },
     { "",            E_GAP,  -1 },
 
     /* Hoerbuecher von einem Audiobookshelf-Server. Nur ein Eintrag:
@@ -79,6 +89,11 @@ static const struct Entry g_entries[] = {
     { "Subscriptions", E_ITEM, SB_POD_SUBS },
     { "Add/Remove ...", E_ITEM, SB_POD_ADD },
     { "Scan",        E_ITEM, SB_POD_SCAN },
+
+    /* Settings abgesetzt: es ist keine Ansicht der Bibliothek, sondern
+     * ein eigenes Fenster - eine Linie trennt es von der Gliederung. */
+    { "",            E_GAP,  -1 },
+    { "",            E_LINE, -1 },
     { "Settings",    E_ITEM, SB_SETTINGS },
 };
 
@@ -160,6 +175,14 @@ static ULONG sb_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
         }
 
         if (e->type == E_GAP) {
+            y += rh / 2;
+            continue;
+        }
+        if (e->type == E_LINE) {
+            if (CyberGfxBase && w > 2 * SB_PAD_X) {
+                FillPixelArray(rp, (UWORD)(l + SB_PAD_X), (UWORD)(y + rh / 4),
+                               (UWORD)(w - 2 * SB_PAD_X), 1, SB_HEAD_RGB);
+            }
             y += rh / 2;
             continue;
         }
@@ -249,7 +272,7 @@ static int entry_at(Object *obj, LONG my)
     for (i = 0; i < SB_COUNT; i++) {
         const struct Entry *e = &g_entries[i];
 
-        if (e->type == E_GAP) {
+        if (e->type == E_GAP || e->type == E_LINE) {
             y += rh / 2;
             continue;
         }
@@ -395,8 +418,9 @@ static ULONG sb_setup(struct IClass *cl, Object *obj, Msg msg)
         tags[1].ti_Tag  = TAG_DONE;
         tags[1].ti_Data = 0;
         d->headpen = ObtainBestPenA(_screen(obj)->ViewPort.ColorMap,
-                                    0x7F7F7F7FUL, 0xA8A8A8A8UL,
-                                    0xFFFFFFFFUL, tags);
+                                    ((SB_HEAD_RGB >> 16) & 0xff) * 0x01010101UL,
+                                    ((SB_HEAD_RGB >> 8) & 0xff) * 0x01010101UL,
+                                    (SB_HEAD_RGB & 0xff) * 0x01010101UL, tags);
     }
 
     d->ehn.ehn_Object   = obj;
