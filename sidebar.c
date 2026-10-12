@@ -51,6 +51,9 @@ static const struct Entry g_entries[] = {
     { "Tracks",      E_ITEM, SB_TRACKS },
     { "Favorites",   E_ITEM, SB_FAVORITES },
     { "Radio",       E_ITEM, SB_RADIO },
+    /* Der allgemeine Scan gehoert zum Server (Wunsch des Anwenders,
+     * 12.10.2026) - Podcasts haben ihren eigenen. */
+    { "Scan",        E_ITEM, SB_SCAN },
     { "",            E_GAP,  -1 },
 
     /* Der eigene Bestand von der Platte, gleich gegliedert wie die
@@ -76,8 +79,6 @@ static const struct Entry g_entries[] = {
     { "Subscriptions", E_ITEM, SB_POD_SUBS },
     { "Add/Remove ...", E_ITEM, SB_POD_ADD },
     { "Scan",        E_ITEM, SB_POD_SCAN },
-    { "",            E_GAP,  -1 },
-    { "Scan",        E_ITEM, SB_SCAN },
     { "Settings",    E_ITEM, SB_SETTINGS },
 };
 
@@ -86,6 +87,12 @@ static const struct Entry g_entries[] = {
 struct SBData {
     LONG   active;              /* SB_..., nicht der Zeilenindex */
     LONG   pressed;
+
+    /* Eigene Farbe fuer die Ueberschriften (Navidrome, Folder, ...) -
+     * alle gleich, damit die Gliederung auf einen Blick lesbar ist
+     * (Wunsch des Anwenders). Ein geteilter Stift vom Bildschirm, in
+     * Setup geholt und in Cleanup zurueckgegeben; -1 = keiner. */
+    LONG   headpen;
 
     struct MUI_EventHandlerNode ehn;
 };
@@ -168,7 +175,8 @@ static ULONG sb_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
 
         switch (e->type) {
         case E_HEAD:
-            pen = _pens(obj)[MPEN_HALFSHINE];
+            pen = (d->headpen >= 0) ? (ULONG)d->headpen
+                                    : _pens(obj)[MPEN_HALFSHINE];
             break;
         case E_DEAD:
             pen = _pens(obj)[MPEN_HALFSHADOW];
@@ -309,6 +317,7 @@ static ULONG sb_new(struct IClass *cl, Object *obj, struct opSet *msg)
     d->active  = (LONG)GetTagData(MUIA_Sb_Active, SB_ALBUMS,
                                   msg->ops_AttrList);
     d->pressed = -1;
+    d->headpen = -1;
     return (ULONG)obj;
 }
 
@@ -375,6 +384,21 @@ static ULONG sb_setup(struct IClass *cl, Object *obj, Msg msg)
     }
     MUI_RequestIDCMP(obj, IDCMP_MOUSEBUTTONS);
 
+    /* Helles Blau, passend zum Auswahlbalken (0x4C7CFE), aber heller -
+     * auf Schwarz gut lesbar. Auf einem Bildschirm mit wenigen Farben
+     * nimmt ObtainBestPen die naechstliegende. */
+    {
+        struct TagItem tags[2];
+
+        tags[0].ti_Tag  = OBP_Precision;
+        tags[0].ti_Data = PRECISION_GUI;
+        tags[1].ti_Tag  = TAG_DONE;
+        tags[1].ti_Data = 0;
+        d->headpen = ObtainBestPenA(_screen(obj)->ViewPort.ColorMap,
+                                    0x7F7F7F7FUL, 0xA8A8A8A8UL,
+                                    0xFFFFFFFFUL, tags);
+    }
+
     d->ehn.ehn_Object   = obj;
     d->ehn.ehn_Class    = cl;
     d->ehn.ehn_Events   = IDCMP_MOUSEBUTTONS;
@@ -390,6 +414,10 @@ static ULONG sb_cleanupm(struct IClass *cl, Object *obj, Msg msg)
 
     DoMethod(_win(obj), MUIM_Window_RemEventHandler, (ULONG)&d->ehn);
     MUI_RejectIDCMP(obj, IDCMP_MOUSEBUTTONS);
+    if (d->headpen >= 0) {
+        ReleasePen(_screen(obj)->ViewPort.ColorMap, (ULONG)d->headpen);
+        d->headpen = -1;
+    }
     return DoSuperMethodA(cl, obj, msg);
 }
 
