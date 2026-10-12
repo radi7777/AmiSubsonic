@@ -436,6 +436,13 @@ static char g_radio_name[SUB_NAME_LEN];
 static char g_radio_home[256];
 static ULONG g_icy_seen = 0;        /* zuletzt angezeigte ICY-Meldung */
 
+/* Wo STOP angehalten hat. Bei Podcast und Hoerbuch geht ein Druck auf
+ * Play dort weiter statt von vorn - eine Folge von 1:34 Stunden von
+ * vorn zu beginnen, weil man kurz gestoppt hat, waere bitter
+ * (12.10.2026: nach Stop stand 0:07 statt 2:12 da). */
+static LONG g_stop_ms = 0;
+static int  g_stop_q  = -1;
+
 /* Mitschrift der Wiedergabe - siehe tick(). */
 static BOOL g_expect_play = FALSE;
 static LONG g_last_pos    = -1;
@@ -474,6 +481,7 @@ static Object *grid_abs;        /* Audiobookshelf/Books */
 static Object *grid_pod;        /* Podcasts/Subscriptions */
 static Object *paddwin, *str_pterm, *btn_psearch, *lv_presults, *lst_presults;
 static Object *btn_psub, *txt_padd;
+static Object *lv_psubs, *lst_psubs, *btn_premove;
 
 /* Das Einstellfenster. Als einziges Fenster dieses Programms besteht es
  * aus MUI-BORDMITTELN - Stringfelder, Ankreuzfeld, Knoepfe. Das ist
@@ -544,6 +552,7 @@ static Object *visual;           /* dritter Reiter: VISUALIZER */
 #define ID_POD_PICK    18
 #define ID_PADD_SEARCH 19
 #define ID_PADD_SUB    20
+#define ID_PADD_REMOVE 21
 #define ID_TAB         9
 #define ID_PLAYER     10
 
@@ -818,6 +827,32 @@ static void lyrics_request(struct Song *s)
 /* ------------------------------------------------------------------ */
 
 /* Die grosse Anzeigeflaeche - sie zeigt, was man sich ANSIEHT. */
+/* Bei Podcast-Folgen steht in der Liste der Stand vorn im Titel
+ * ("(at 2:12) 7 Oct 2026 ..."). Bedienleiste und Flaeche sollen den
+ * reinen Titel aus dem Feed zeigen (12.10.2026). */
+static const char *song_title(const struct Song *s)
+{
+    const struct PodFeed *f[2];
+    int k, i;
+
+    if (!s->podshow[0]) {
+        return s->title;
+    }
+    f[0] = &g_pod_play;
+    f[1] = &g_pod_view;
+    for (k = 0; k < 2; k++) {
+        if (strcmp(f[k]->show.id, s->podshow) != 0) {
+            continue;
+        }
+        for (i = 0; i < f[k]->count; i++) {
+            if (strcmp(f[k]->ep[i].key, s->id) == 0) {
+                return f[k]->ep[i].title;
+            }
+        }
+    }
+    return s->title;
+}
+
 static void show_song(int idx)
 {
     struct Song *s = (struct Song *)list_get(&g_songs, idx);
@@ -828,7 +863,7 @@ static void show_song(int idx)
         return;
     }
 
-    set(panel, MUIA_Panel_Title,  (ULONG)s->title);
+    set(panel, MUIA_Panel_Title,  (ULONG)song_title(s));
     set(panel, MUIA_Panel_Artist, (ULONG)s->artist);
     set(panel, MUIA_Panel_Album,  (ULONG)s->album);
 
@@ -859,7 +894,7 @@ static void panel_show_now(void)
     if (!g_now_ok) {
         return;
     }
-    set(panel, MUIA_Panel_Title,  (ULONG)g_now.title);
+    set(panel, MUIA_Panel_Title,  (ULONG)song_title(&g_now));
     set(panel, MUIA_Panel_Artist, (ULONG)g_now.artist);
     set(panel, MUIA_Panel_Album,  (ULONG)g_now.album);
 
@@ -894,7 +929,7 @@ static void now_show(void)
     if (!g_now_ok) {
         return;
     }
-    set(player, MUIA_Pl_Title,  (ULONG)g_now.title);
+    set(player, MUIA_Pl_Title,  (ULONG)song_title(&g_now));
     set(player, MUIA_Pl_Artist, (ULONG)g_now.artist);
     set(player, MUIA_Pl_Album,  (ULONG)g_now.album);
     set(player, MUIA_Pl_Total,  g_now.duration);
@@ -1236,6 +1271,7 @@ static void play_queue_at(int qidx, LONG start_ms)
     if (qidx < 0 || qidx >= g_qcount) {
         return;
     }
+    g_stop_q = -1;                  /* eine alte Stopp-Stelle gilt nicht mehr */
     if (!stream_start(qidx, start_ms)) {
         return;
     }
@@ -2124,7 +2160,7 @@ static void radio_show_title(const char *t)
         strncpy(g_now.artist, g_radio_name, sizeof(g_now.artist) - 1);
     }
 
-    set(player, MUIA_Pl_Title,  (ULONG)g_now.title);
+    set(player, MUIA_Pl_Title,  (ULONG)song_title(&g_now));
     set(player, MUIA_Pl_Artist, (ULONG)g_now.artist);
     set(player, MUIA_Pl_Album,  (ULONG)g_now.album);
 }
@@ -3467,6 +3503,16 @@ static void pods_load(void)
     DoMethod(grid_pod, MUIM_AG_SetList,
              (ULONG)&g_palbums, (ULONG)g_pthumbs);
     g_pfill = (g_palbums.count > 0 && g_pthumbs) ? 0 : -1;
+
+    /* Dieselbe Reihe im Fenster "Add/Remove", unter "Your podcasts" -
+     * Index gleich, damit Remove weiss, welches Abo gemeint ist. */
+    DoMethod(lst_psubs, MUIM_List_Clear);
+    for (i = 0; i < g_pshows.count; i++) {
+        struct PodShow *p = (struct PodShow *)list_get(&g_pshows, i);
+
+        DoMethod(lst_psubs, MUIM_List_InsertSingle, (ULONG)p->title,
+                 MUIV_List_Insert_Bottom);
+    }
 }
 
 static void pthumb_load(int idx, const char *path)
@@ -3868,6 +3914,74 @@ static void padd_results(void)
     }
     sprintf(msg, "%d found", g_psearch.count);
     set(txt_padd, MUIA_Text_Contents, (ULONG)msg);
+}
+
+/* Ein Abo entfernen. Mit Rueckfrage: es nimmt den gemerkten Stand aller
+ * Folgen mit, ein Fehlklick waere aergerlich (Wunsch des Anwenders). */
+static void padd_remove(void)
+{
+    LONG n = -1;
+    struct PodShow *p;
+    char id[12], title[SUB_NAME_LEN], cov[SUB_ID_LEN], path[256];
+    ULONG args[1];
+    char msg[160];
+
+    get(lst_psubs, MUIA_List_Active, &n);
+    p = (n >= 0) ? (struct PodShow *)list_get(&g_pshows, (int)n) : NULL;
+    if (!p) {
+        set(txt_padd, MUIA_Text_Contents,
+            (ULONG)"select one of your podcasts first");
+        return;
+    }
+    /* Waehrend ihr Feed gerade aufgefrischt wird, nicht loeschen - der
+     * Netzprozess schriebe die Datei danach wieder hin. */
+    if (g_pod_job_busy || net_busy()) {
+        set(txt_padd, MUIA_Text_Contents,
+            (ULONG)"busy - try again in a moment");
+        return;
+    }
+    strcpy(id, p->id);
+    strcpy(title, p->title);
+
+    args[0] = (ULONG)title;
+    if (MUI_RequestA(app, paddwin, 0, "Remove podcast", "_Remove|_Cancel",
+                     "Remove \33b%s\33n?\n\n"
+                     "Played state and positions are lost.",
+                     args) != 1) {
+        return;
+    }
+
+    /* Laeuft gerade eine Folge daraus: anhalten und den Stand NICHT
+     * mehr schreiben - sonst entstuende die .state-Datei sofort neu. */
+    if (g_now_ok && strcmp(g_now.podshow, id) == 0) {
+        audio_halt();
+        net_stream_end();
+        g_expect_play = FALSE;
+        set(player, MUIA_Pl_Playing, FALSE);
+    }
+    if (strcmp(g_pod_play.show.id, id) == 0) {
+        memset(&g_pod_play, 0, sizeof(g_pod_play));
+    }
+    if (strcmp(g_pod_view.show.id, id) == 0) {
+        /* UP NEXT zeigte sie: abhaengen. Ein Doppelklick findet danach
+         * keine Folge mehr (g_pod_view ist leer). */
+        memset(&g_pod_view, 0, sizeof(g_pod_view));
+        DoMethod(lst_queue, MUIM_TL_SetList, (ULONG)NULL);
+    }
+    g_pscan = -1;                   /* ein laufender Scan zaehlt um */
+
+    pod_remove(id);
+    pod_cover_id(id, cov);
+    if (cache_have(&g_prefs, cov)) {
+        cache_path(&g_prefs, cov, path, sizeof(path));
+        DeleteFile((STRPTR)path);
+    }
+
+    sprintf(msg, "removed: %.100s", title);
+    set(txt_padd, MUIA_Text_Contents, (ULONG)msg);
+    say(msg);
+    g_pod_seen = TRUE;
+    pods_load();
 }
 
 /* Suchfenster: den gewaehlten Treffer abonnieren. */
@@ -5030,11 +5144,11 @@ int main(void)
          * ein Suchfeld, eine Trefferliste, ein Knopf. Gesucht wird bei
          * Apple (pod_search), im Netzprozess. */
         MUIA_Application_Window, paddwin = MUI_NewObject(MUIC_Window,
-            MUIA_Window_Title,  "AmiSubsonic - Add podcast",
+            MUIA_Window_Title,  "AmiSubsonic - Podcasts",
             MUIA_Window_ID,     0x41535041UL,   /* 'ASPA' */
             MUIA_Window_PublicScreen, (ULONG)g_pubname,
             MUIA_Window_Width,  520,
-            MUIA_Window_Height, 340,
+            MUIA_Window_Height, 460,
             MUIA_Window_RootObject, MUI_NewObject(MUIC_Group,
                 MUIA_Group_Child, MUI_NewObject(MUIC_Group,
                     MUIA_Group_Horiz, TRUE,
@@ -5061,6 +5175,29 @@ int main(void)
                         MUI_MakeObject(MUIO_Button, (ULONG)"Subscribe"),
                     MUIA_Group_Child, txt_padd = MUI_NewObject(MUIC_Text,
                         MUIA_Text_Contents, (ULONG)"search the Apple podcast directory",
+                        TAG_DONE),
+                    TAG_DONE),
+
+                /* Die eigenen Abos, zum Entfernen. */
+                MUIA_Group_Child, MUI_NewObject(MUIC_Group,
+                    MUIA_Frame,      MUIV_Frame_Group,
+                    MUIA_FrameTitle, "Your podcasts",
+                    MUIA_Group_Child, lv_psubs = MUI_NewObject(MUIC_Listview,
+                        MUIA_Listview_List, lst_psubs =
+                            MUI_NewObject(MUIC_List,
+                                MUIA_Frame, MUIV_Frame_InputList,
+                                MUIA_List_ConstructHook,
+                                    MUIV_List_ConstructHook_String,
+                                MUIA_List_DestructHook,
+                                    MUIV_List_DestructHook_String,
+                                TAG_DONE),
+                        TAG_DONE),
+                    MUIA_Group_Child, MUI_NewObject(MUIC_Group,
+                        MUIA_Group_Horiz, TRUE,
+                        MUIA_Group_Child, btn_premove =
+                            MUI_MakeObject(MUIO_Button, (ULONG)"Remove"),
+                        MUIA_Group_Child, MUI_NewObject(MUIC_Rectangle,
+                            TAG_DONE),
                         TAG_DONE),
                     TAG_DONE),
                 TAG_DONE),
@@ -5215,6 +5352,8 @@ int main(void)
              app, 2, MUIM_Application_ReturnID, ID_PADD_SUB);
     DoMethod(lv_presults, MUIM_Notify, MUIA_Listview_DoubleClick, TRUE,
              app, 2, MUIM_Application_ReturnID, ID_PADD_SUB);
+    DoMethod(btn_premove, MUIM_Notify, MUIA_Pressed, FALSE,
+             app, 2, MUIM_Application_ReturnID, ID_PADD_REMOVE);
     DoMethod(lst_queue, MUIM_Notify, MUIA_TL_DoubleClick, TRUE,
              app, 2, MUIM_Application_ReturnID, ID_SONG_PICK);
     DoMethod(lst_tracks, MUIM_Notify, MUIA_TL_DoubleClick, TRUE,
@@ -5336,7 +5475,12 @@ int main(void)
                 pods_show();
                 break;
             case SB_POD_ADD:
-                /* Ein Fenster, kein Seitenwechsel - wie Settings. */
+                /* Ein Fenster, kein Seitenwechsel - wie Settings. Die
+                 * Abos muessen fuer "Your podcasts" gelesen sein. */
+                if (!g_pod_seen) {
+                    g_pod_seen = TRUE;
+                    pods_load();
+                }
                 set(paddwin, MUIA_Window_Open, TRUE);
                 set(paddwin, MUIA_Window_ActiveObject, (ULONG)str_pterm);
                 set(sidebar, MUIA_Sb_Active, g_sb_home);
@@ -5377,6 +5521,10 @@ int main(void)
 
         case ID_PADD_SUB:
             padd_subscribe();
+            break;
+
+        case ID_PADD_REMOVE:
+            padd_remove();
             break;
 
         case ID_ABOOK_PICK: {
@@ -5546,7 +5694,13 @@ int main(void)
                     audio_pause(FALSE);
                     set(player, MUIA_Pl_Playing, TRUE);
                 } else if (g_qpos >= 0) {
-                    play_queue(g_qpos);
+                    LONG at = 0;
+
+                    if (g_stop_q == g_qpos && g_now_ok
+                            && (g_now.podshow[0] || g_now.absitem[0])) {
+                        at = g_stop_ms;
+                    }
+                    play_queue_at(g_qpos, at);
                 } else if (g_songs.count > 0) {
                     LONG sel = -1;
 
@@ -5559,6 +5713,10 @@ int main(void)
                 break;
 
             case PLB_STOP:
+                if (audio_state() != AU_STOPPED) {
+                    g_stop_ms = audio_pos_ms();
+                    g_stop_q  = g_qpos;
+                }
                 abs_note();
                 audio_halt();
                 net_stream_end();

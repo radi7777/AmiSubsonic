@@ -74,7 +74,7 @@ static const struct Entry g_entries[] = {
      * weil das Auffrischen vieler Feeds dauert. */
     { "Podcasts",    E_HEAD, -1 },
     { "Subscriptions", E_ITEM, SB_POD_SUBS },
-    { "Add ...",     E_ITEM, SB_POD_ADD },
+    { "Add/Remove ...", E_ITEM, SB_POD_ADD },
     { "Scan",        E_ITEM, SB_POD_SCAN },
     { "",            E_GAP,  -1 },
     { "Scan",        E_ITEM, SB_SCAN },
