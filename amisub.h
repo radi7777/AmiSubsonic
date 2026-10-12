@@ -83,6 +83,14 @@ struct Prefs {
     BOOL  ownscreen;
     ULONG screenid;
     int   screenw, screenh, screend;
+
+    /* Audiobookshelf, ein eigener Server fuer Hoerbuecher. absurl ist
+     * "http://rechner:port" ohne Pfad; leer heisst: nicht eingerichtet.
+     * Ein eigener Zugang, weil es ein anderer Server mit anderen
+     * Benutzern ist als Navidrome. */
+    char absurl[128];
+    char absuser[64];
+    char abspass[128];
 };
 
 struct Artist {
@@ -223,6 +231,20 @@ BOOL sub_radio_is_mp3(const char *ctype);
 BOOL sub_radio_is_aac(const char *ctype);
 /* TRUE, wenn die Adresse nach AAC aussieht - nur eine Vermutung. */
 BOOL sub_radio_url_aac(const char *url);
+
+/* Anfrage an einen zweiten Server (Audiobookshelf). base ist
+ * "http://rechner:port", path faengt mit '/' an, hdrs sind fertige
+ * Kopfzeilen mit "\r\n" (oder NULL), body ein JSON-Rumpf (oder NULL).
+ * Den Rumpf der Antwort gibt der Aufrufer mit free() frei. */
+int  sub_http_request(const char *base, const char *method, const char *path,
+                      const char *hdrs, const char *body,
+                      char **resp_body, long *resp_len);
+/* Datei als Strom ab Byte offset, gelesen mit sub_stream_read. Bei 200
+ * statt 206 steht st->pos auf 0: der Server hat Range uebergangen. */
+int  sub_url_stream_open(const char *base, const char *path, long offset,
+                         struct SubStream *st);
+/* HTTP-Status der letzten Antwort, 0 = keine bekommen. */
+int  sub_last_http_status(void);
 
 /* Misst, ob der Server einen Einstieg mitten im Titel erlaubt (HTTP 206).
  * fmt = NULL oder "" fragt ohne Umkodierung, sonst z.B. "mp3". */

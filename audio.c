@@ -1446,6 +1446,86 @@ LONG audio_state(void)
     return g_ap_state;
 }
 
+/* ------------------------------------------------------------------ */
+/* Rahmenanfang nach einem Sprung                                      */
+/* ------------------------------------------------------------------ */
+
+/* In den Datenbereich, nicht in den Code - siehe VIS_DATA in visual.c. */
+#define AU_DATA __attribute__((section(".data")))
+
+/* kbit/s je Index 1..14: MPEG-1 Layer 1/2/3, MPEG-2/2.5 Layer 1, Layer 2/3 */
+static UWORD g_br_tab[5][14] AU_DATA = {
+    { 32, 64, 96,128,160,192,224,256,288,320,352,384,416,448 },
+    { 32, 48, 56, 64, 80, 96,112,128,160,192,224,256,320,384 },
+    { 32, 40, 48, 56, 64, 80, 96,112,128,160,192,224,256,320 },
+    { 32, 48, 56, 64, 80, 96,112,128,144,160,176,192,224,256 },
+    {  8, 16, 24, 32, 40, 48, 56, 64, 80, 96,112,128,144,160 }
+};
+static UWORD g_sr_tab[3] AU_DATA = { 44100, 48000, 32000 };
+
+/* Laenge des Rahmens, dessen Kopf bei b steht, 0 = kein gueltiger Kopf. */
+static LONG mp3_frame_len(const UBYTE *b)
+{
+    LONG ver, layer, bri, sri, pad, br, sr, t;
+
+    if (b[0] != 0xff || (b[1] & 0xe0) != 0xe0) {
+        return 0;
+    }
+    ver   = (b[1] >> 3) & 3;        /* 3 = MPEG-1, 2 = MPEG-2, 0 = 2.5 */
+    layer = (b[1] >> 1) & 3;        /* 3 = Layer 1, 2 = 2, 1 = 3 */
+    bri   = (b[2] >> 4) & 15;
+    sri   = (b[2] >> 2) & 3;
+    pad   = (b[2] >> 1) & 1;
+    if (ver == 1 || layer == 0 || bri == 0 || bri == 15 || sri == 3) {
+        return 0;
+    }
+    if (ver == 3) {
+        t = 3 - layer;              /* Layer 1 -> 0, 2 -> 1, 3 -> 2 */
+    } else {
+        t = (layer == 3) ? 3 : 4;
+    }
+    br = (LONG)g_br_tab[t][bri - 1] * 1000L;
+    sr = g_sr_tab[sri];
+    if (ver == 2) {
+        sr /= 2;
+    } else if (ver == 0) {
+        sr /= 4;
+    }
+    if (layer == 3) {
+        return (12L * br / sr + pad) * 4L;
+    }
+    if (layer == 1 && ver != 3) {
+        return 72L * br / sr + pad;         /* Layer 3, MPEG-2/2.5 */
+    }
+    return 144L * br / sr + pad;
+}
+
+LONG mp3_find_frame(const UBYTE *b, LONG n)
+{
+    LONG i, len, len2;
+
+    for (i = 0; i + 4 <= n; i++) {
+        len = mp3_frame_len(b + i);
+        if (len <= 0) {
+            continue;
+        }
+        /* Ein Kopf allein beweist nichts - 0xFF-Folgen gibt es in den
+         * Audiodaten reichlich (11 Stueck auf den ersten 289 Bytes,
+         * gemessen). Erst wenn genau eine Rahmenlaenge weiter der
+         * naechste Kopf steht, mit gleicher Fassung und Abtastrate,
+         * ist es ein Rahmen. */
+        if (i + len + 4 > n) {
+            return -1;              /* zu wenig Daten zum Pruefen */
+        }
+        len2 = mp3_frame_len(b + i + len);
+        if (len2 > 0 && (b[i + 1] & 0xfe) == (b[i + len + 1] & 0xfe) &&
+            (b[i + 2] & 0x0c) == (b[i + len + 2] & 0x0c)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 LONG audio_pos_ms(void)
 {
     LONG freq = g_ap_freq > 0 ? g_ap_freq : 44100;

@@ -21,6 +21,7 @@
 
 #include "audio.h"
 #include "ring.h"
+#include "abs.h"
 
 /* aacdec.h kennt keinen 68k und bricht sonst mit #error ab. ARDUINO ist
  * dort nur ein leerer Plattformzweig - die Rechenroutinen stehen in
@@ -75,6 +76,28 @@ static char           g_fill_err[160];
 #define FILL_PATIENCE  (180 * 50)   /* in Ticks zu 1/50 s */
 #define FILL_PAUSE     100          /* 2 s zwischen zwei Anlaeufen */
 
+/* Woher der Fueller liest. Vorgabe ist ein Titel vom Navidrome-Server;
+ * fuer Audiobookshelf wird umgestellt (cmd_abs). So bleibt es EIN
+ * Fueller mit derselben Wiederaufnahme nach Netzausfall und demselben
+ * ID3-Sprung - nur das Oeffnen ist verschieden. */
+static int nav_open(long off, struct SubStream *st)
+{
+    return sub_stream_open(&g_fprefs, g_fid, off, st);
+}
+static int  (*g_fopen)(long off, struct SubStream *st) = nav_open;
+static const char *(*g_ferrstr)(void) = sub_last_error;
+
+/* Bytes, die nach dem ID3-Etikett noch zu ueberspringen sind - der
+ * Einstieg mitten in eine Datei. Erst NACH dem Etikett, weil dessen
+ * Laenge vorher keiner kennt. */
+static long g_fskip = 0;
+
+/* Wird gerufen, solange der Fueller wartet (Ring voll) und nachdem die
+ * Datei ganz im Ring ist, bis der Hauptprozess Schluss sagt - mit
+ * final = TRUE ein letztes Mal. Dort schreibt Audiobookshelf die
+ * Hoerposition zurueck: das Netz gehoert diesem Prozess. */
+static void (*g_fidle)(BOOL final) = NULL;
+
 static void filler(void)
 {
     struct SubStream st;
@@ -82,6 +105,7 @@ static void filler(void)
     UBYTE *chunk;
     long off = 0;
     long waited = 0;            /* Ticks, die schon vergeblich vergingen */
+    int  need_sync = 0;         /* nach einem Sprung: erst Rahmen suchen */
 
     chunk = AllocVec(FILL_CHUNK, MEMF_PUBLIC);
     if (!chunk) {
@@ -97,9 +121,9 @@ static void filler(void)
         if (g_ring.stop) {
             break;
         }
-        if (sub_stream_open(&g_fprefs, g_fid, off, &st) != SUB_OK) {
+        if (g_fopen(off, &st) != SUB_OK) {
             if (waited >= FILL_PATIENCE) {
-                strncpy(g_fill_err, sub_last_error(),
+                strncpy(g_fill_err, g_ferrstr(),
                         sizeof(g_fill_err) - 1);
                 break;
             }
@@ -162,6 +186,17 @@ static void filler(void)
             off = st.pos;
             g_fill_bytes = off;
             g_t_id3 = ticks_now() - t0 - g_t_conn;
+
+            /* Einstieg mitten in die Datei: Etikett ist vorbei, jetzt
+             * neu ansetzen. Eine zweite Verbindung, aber nur eine
+             * kurze - billiger, als bis zur Stelle mitzulesen. */
+            if (g_fskip > 0) {
+                sub_stream_close(&st);
+                off += g_fskip;
+                g_fskip = 0;
+                need_sync = 4;      /* hoechstens vier Scheiben suchen */
+                continue;
+            }
         }
 
         for (;;) {
@@ -172,12 +207,30 @@ static void filler(void)
              * liefe der Titel schneller herein, als er gehoert wird,
              * und der Speicher waere umsonst gross. */
             if (ring_space(&g_ring) < FILL_CHUNK) {
+                if (g_fidle) {
+                    g_fidle(FALSE);
+                }
                 Delay(2);
                 continue;
             }
             n = sub_stream_read(&st, chunk, FILL_CHUNK);
             if (n > 0) {
                 ULONG put = 0;
+
+                /* Mitten in der Datei steht vor dem ersten Rahmen
+                 * Rauschen mit falschen Synchronwoertern - das darf
+                 * mpega.library nicht als Erstes sehen. Was davor
+                 * liegt, wird verworfen (unter einer halben Sekunde). */
+                if (need_sync > 0) {
+                    LONG k = mp3_find_frame(chunk, n);
+
+                    if (k < 0 && --need_sync > 0) {
+                        off = st.pos;
+                        continue;
+                    }
+                    put = (k > 0) ? (ULONG)k : 0;
+                    need_sync = 0;
+                }
 
                 while (put < (ULONG)n && !g_ring.stop) {
                     ULONG w = ring_write(&g_ring, chunk + put,
@@ -218,6 +271,17 @@ done:
     sub_stream_close(&st);
     FreeVec(chunk);
     g_ring.eof = TRUE;
+
+    /* Die Datei ist im Ring, gespielt wird sie noch eine Weile - bei
+     * 1 MB Ring und 128 kbps gut eine Minute. Wer in dieser Zeit
+     * Positionen abgleichen muss, bleibt solange hier. */
+    if (g_fidle) {
+        while (!g_ring.stop) {
+            g_fidle(FALSE);
+            Delay(10);
+        }
+        g_fidle(TRUE);
+    }
     g_fill_done = 1;
     sub_cleanup();                      /* AmiSSL gehoert diesem Prozess */
 }
@@ -584,6 +648,7 @@ static void usage(void)
 "  aac <datei|sender-nr> [kbytes] [pcm-datei]  AAC-Dekodiertempo messen\n"
 "  ptest <titel-id> [ahi-unit]                 Audioprozess: Pause, Position\n"
 "  range <titel-id> [offset] [format] [kbps]   Einstieg mitten im Titel\n"
+"  abs ...                                     Audiobookshelf (Hoerbuecher)\n"
 "\n"
 "\n"
 "Der Zugang steht in ENVARC:AmiSubsonic/AmiSubsonic.prefs.\n");
@@ -732,6 +797,422 @@ static int cmd_similar(struct Prefs *p, const char *id)
  * das AmiSSL nicht aufraeumt, kann laut dessen Doku die naechste
  * Anwendung mitreissen. Bei einem Dutzend return-Stellen ist eine
  * Klammer sicherer als ein Aufruf vor jedem einzelnen. */
+/* ------------------------------------------------------------------ */
+/* Audiobookshelf                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Was der Fueller fuer Audiobookshelf braucht. Die Liste der Dateien
+ * holt der Hauptprozess VOR dem ersten Fueller; danach fasst er das
+ * Netz nicht mehr an (sub_cleanup), denn ab dann gehoert es dem
+ * jeweiligen Fueller. */
+static char           g_abs_item[SUB_ID_LEN];
+static struct AbsTrack g_abs_cur;
+static long           g_abs_dur = 0;
+
+/* Die Stelle im BUCH, die gerade zu hoeren ist. Schreibt der
+ * Hauptprozess, liest der Fueller. Ein LONG ist auf dem 68k unteilbar. */
+static volatile LONG  g_abs_pos = -1;
+static LONG           g_abs_synced = -1;
+static LONG           g_abs_tsync = 0;
+static volatile LONG  g_abs_syncs = 0;
+static char           g_abs_syncerr[120];
+
+/* Alle 30 s zurueckschreiben. Faellt der Amiga aus, fehlen auf dem
+ * naechsten Geraet hoechstens diese 30 s. Oefter braucht es nicht -
+ * jeder Abgleich ist eine eigene Verbindung. */
+#define ABS_SYNC_TICKS  (30 * 50)
+
+static int abs_fopen(long off, struct SubStream *st)
+{
+    return abs_open_file(&g_fprefs, g_abs_item, g_abs_cur.ino, off, st);
+}
+
+static void abs_idle(BOOL final)
+{
+    LONG now = ticks_now();
+    LONG pos = g_abs_pos;
+
+    if (pos < 0 || pos == g_abs_synced) {
+        return;
+    }
+    /* now < g_abs_tsync: Mitternacht, ticks_now() faengt neu an. */
+    if (!final && now >= g_abs_tsync && now - g_abs_tsync < ABS_SYNC_TICKS) {
+        return;
+    }
+    g_abs_tsync = now;
+    if (abs_set_pos(&g_fprefs, g_abs_item, pos, g_abs_dur) == SUB_OK) {
+        g_abs_synced = pos;
+        g_abs_syncs++;
+        g_abs_syncerr[0] = '\0';
+    } else {
+        strncpy(g_abs_syncerr, abs_last_error(), sizeof(g_abs_syncerr) - 1);
+    }
+}
+
+static void hms(long ms, char *out)
+{
+    duration_text((int)(ms / 1000), out, 16);
+}
+
+/* "3" ist die dritte Zeile aus "abs books", alles Laengere eine ID. */
+static int abs_pick(struct Prefs *p, const char *arg, struct AbsBook *b)
+{
+    struct SubList l;
+    int rc, nr;
+
+    memset(b, 0, sizeof(*b));
+    if (strlen(arg) > 4) {
+        strncpy(b->id, arg, sizeof(b->id) - 1);
+        return abs_get_pos(p, b->id, &b->pos_ms, &b->finished);
+    }
+    nr = atoi(arg);
+    list_init(&l, sizeof(struct AbsBook));
+    rc = abs_books(p, &l);
+    if (rc == SUB_OK) {
+        if (nr < 1 || nr > l.count) {
+            printf("kein Buch Nr. %d (es gibt %d)\n", nr, l.count);
+            rc = SUB_EAPI;
+        } else {
+            *b = *(struct AbsBook *)list_get(&l, nr - 1);
+        }
+    }
+    list_free(&l);
+    return rc;
+}
+
+static int abs_play(struct Prefs *p, struct AbsBook *b, long start_ms)
+{
+    struct SubList tr;
+    LONG t0;
+    long in_ms = 0;
+    int rc, k, first;
+    BOOL quit = FALSE;
+    char t1[16], t2[16];
+
+    list_init(&tr, sizeof(struct AbsTrack));
+    t0 = ticks_now();
+    rc = abs_tracks(p, b->id, &tr, &g_abs_dur);
+    if (rc != SUB_OK) {
+        list_free(&tr);
+        return rc;
+    }
+    printf("%d Dateien, Liste geholt in %ld.%02ld s\n", tr.count,
+           (long)((ticks_now() - t0) / 50),
+           (long)(((ticks_now() - t0) % 50) * 2));
+        fflush(stdout);
+
+    /* Ab hier gehoert das Netz den Fuellern. */
+    sub_cleanup();
+
+    if (start_ms < 0) {
+        start_ms = b->pos_ms;
+    }
+    first = abs_find_track(&tr, start_ms, &in_ms);
+    hms(start_ms, t1);
+    hms(g_abs_dur, t2);
+    printf("Start bei %s von %s - Datei %d, %ld.%03ld s hinein\n",
+           t1, t2, first + 1, in_ms / 1000, in_ms % 1000);
+        fflush(stdout);
+
+    if (!ring_init(&g_ring, 1024UL * 1024UL)) {
+        printf("zu wenig Speicher fuer den Ringpuffer\n");
+        fflush(stdout);
+        list_free(&tr);
+        return SUB_EMEM;
+    }
+    if (!audio_start(p->ahiunit)) {
+        printf("%s\n", audio_last_error());
+        fflush(stdout);
+        ring_free(&g_ring);
+        list_free(&tr);
+        return SUB_EMEM;
+    }
+    audio_set_volume(64);
+
+    g_fprefs = *p;
+    strncpy(g_abs_item, b->id, sizeof(g_abs_item) - 1);
+    g_fopen = abs_fopen;
+    g_ferrstr = abs_last_error;
+    g_fidle = abs_idle;
+    g_abs_pos = start_ms;
+    g_abs_synced = start_ms;    /* steht schon so auf dem Server */
+    g_abs_tsync = ticks_now();
+    g_abs_syncs = 0;
+    g_abs_syncerr[0] = '\0';
+
+    for (k = first; k < tr.count && !quit; k++) {
+        struct Process *proc;
+        LONG last_print = 0;
+
+        g_abs_cur = *(struct AbsTrack *)list_get(&tr, k);
+        g_fskip = (in_ms > 0) ? abs_byte_for_ms(&g_abs_cur, in_ms) : 0;
+
+        ring_reset(&g_ring);
+        g_fill_done = 0;
+        g_fill_err[0] = '\0';
+        g_fill_reconnects = 0;
+        g_fill_id3 = 0;
+        g_fill_bytes = 0;
+
+        proc = CreateNewProcTags(NP_Entry,     (ULONG)filler,
+                                 NP_Name,      (ULONG)"AmiSubsonic.fill",
+                                 NP_StackSize, 65536,
+                                 NP_Priority,  0,
+                                 TAG_DONE);
+        if (!proc) {
+            printf("Fuellprozess laesst sich nicht starten\n");
+        fflush(stdout);
+            break;
+        }
+
+        /* Vorrat sammeln. Strg-C muss auch hier greifen, siehe
+         * "stream" - bei totem Netz haengt man sonst fest. */
+        while (ring_used(&g_ring) < 64UL * 1024UL && !g_ring.eof) {
+            if (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C) {
+                quit = TRUE;
+                break;
+            }
+            Delay(5);
+        }
+        if (g_fill_err[0]) {
+            printf("Fueller: %s\n", g_fill_err);
+        fflush(stdout);
+            quit = TRUE;
+        }
+        if (!quit) {
+            hms(g_abs_cur.start_ms + in_ms, t1);
+            printf("[%d/%d] %s  (ab %s)\n", k + 1, tr.count,
+                   g_abs_cur.title, t1);
+        fflush(stdout);
+            audio_play(&g_ring, in_ms);
+
+            for (;;) {
+                Delay(25);
+                if (audio_state() == AU_PLAYING) {
+                    g_abs_pos = g_abs_cur.start_ms + audio_pos_ms();
+                }
+                if (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C) {
+                    audio_halt();
+                    quit = TRUE;
+                    break;
+                }
+                if (audio_track_done()) {
+                    hms(g_abs_pos, t1);
+                    printf("    Datei zu Ende bei %s (%ld ms in der Datei, "
+                           "Datei hat %ld ms, %ld Bytes geholt von %ld)\n",
+                           t1, (long)audio_pos_ms(), g_abs_cur.dur_ms,
+                           (long)g_fill_bytes, g_abs_cur.size);
+                    fflush(stdout);
+                    break;
+                }
+                if (audio_error()) {
+                    printf("Datei nicht lesbar (%s; ID3 %ld B, Stelle %ld, "
+                           "Neuanlaeufe %ld, Ring %ld B%s%s) - weiter mit "
+                           "der naechsten\n", audio_last_error(),
+                           (long)g_fill_id3, (long)g_fill_bytes,
+                           (long)g_fill_reconnects,
+                           (long)ring_used(&g_ring),
+                           g_fill_err[0] ? ", Fueller: " : "", g_fill_err);
+        fflush(stdout);
+                    break;
+                }
+                if (ticks_now() - last_print >= 15 * 50 ||
+                    ticks_now() < last_print) {
+                    last_print = ticks_now();
+                    hms(g_abs_pos, t1);
+                    printf("    %s  abgeglichen %ld mal%s%s\n", t1,
+                           (long)g_abs_syncs,
+                           g_abs_syncerr[0] ? " - FEHLER: " : "",
+                           g_abs_syncerr);
+        fflush(stdout);
+                }
+            }
+        }
+
+        /* Schluss fuer diese Datei. Der Fueller gleicht dabei ein
+         * letztes Mal ab - beim Abbruch ist das die wichtigste Stelle. */
+        g_ring.stop = TRUE;
+        while (!g_fill_done) {
+            Delay(2);
+        }
+        in_ms = 0;
+    }
+
+    audio_shutdown();
+    ring_free(&g_ring);
+    hms(g_abs_synced, t1);
+    printf("Stand auf dem Server: %s (%ld Abgleiche)%s%s\n", t1,
+           (long)g_abs_syncs, g_abs_syncerr[0] ? " - letzter Fehler: " : "",
+           g_abs_syncerr);
+        fflush(stdout);
+    list_free(&tr);
+    return SUB_OK;
+}
+
+/* abs setup <url> <benutzer> <passwort>
+ * abs books | tracks <nr> | pos <nr> [sek] | play <nr> [sek] */
+static int cmd_abs(struct Prefs *p, int argc, char **argv)
+{
+    struct AbsBook b;
+    const char *sub = argc > 0 ? argv[0] : "";
+    char t1[16], t2[16];
+    int rc = SUB_OK;
+
+    if (stricmp(sub, "setup") == 0 && argc >= 4) {
+        int n;
+
+        strncpy(p->absurl, argv[1], sizeof(p->absurl) - 1);
+        n = (int)strlen(p->absurl);
+        while (n > 0 && p->absurl[n - 1] == '/') {
+            p->absurl[--n] = '\0';
+        }
+        strncpy(p->absuser, argv[2], sizeof(p->absuser) - 1);
+        strncpy(p->abspass, argv[3], sizeof(p->abspass) - 1);
+        rc = prefs_save(p);
+        if (rc == SUB_OK) {
+            printf("gesichert: %s  Benutzer %s\n", p->absurl, p->absuser);
+            rc = abs_login(p);
+            if (rc == SUB_OK) {
+                printf("Anmeldung in Ordnung.\n");
+            }
+        }
+    } else if (stricmp(sub, "login") == 0) {
+        rc = abs_login(p);
+        if (rc == SUB_OK) {
+            printf("%s - Anmeldung in Ordnung.\n", p->absurl);
+        }
+    } else if (stricmp(sub, "books") == 0) {
+        struct SubList l;
+        LONG t0 = ticks_now();
+        int i;
+
+        list_init(&l, sizeof(struct AbsBook));
+        rc = abs_books(p, &l);
+        if (rc == SUB_OK) {
+            for (i = 0; i < l.count; i++) {
+                struct AbsBook *x = (struct AbsBook *)list_get(&l, i);
+                long pct = x->dur_ms > 0 ? x->pos_ms / (x->dur_ms / 100 + 1) : 0;
+
+                hms(x->pos_ms, t1);
+                hms(x->dur_ms, t2);
+                printf("%2d %-36.36s %-20.20s %s / %s (%ld%%)%s\n", i + 1,
+                       x->title, x->author, t1, t2, pct,
+                       x->finished ? " fertig" : "");
+            }
+            printf("%d Buecher in %ld.%02ld s\n", l.count,
+                   (long)((ticks_now() - t0) / 50),
+                   (long)(((ticks_now() - t0) % 50) * 2));
+        }
+        list_free(&l);
+    } else if (stricmp(sub, "tracks") == 0 && argc >= 2) {
+        struct SubList l;
+        LONG t0;
+        long dur = 0;
+        int i;
+
+        rc = abs_pick(p, argv[1], &b);
+        if (rc != SUB_OK) {
+            goto out;
+        }
+        list_init(&l, sizeof(struct AbsTrack));
+        t0 = ticks_now();
+        rc = abs_tracks(p, b.id, &l, &dur);
+        if (rc == SUB_OK) {
+            for (i = 0; i < l.count; i++) {
+                struct AbsTrack *x = (struct AbsTrack *)list_get(&l, i);
+
+                hms(x->start_ms, t1);
+                hms(x->dur_ms, t2);
+                printf("%3d %8s %6s %4ld kbps %s\n", i + 1, t1, t2,
+                       x->bitrate / 1000, x->title);
+            }
+            hms(dur, t1);
+            printf("%d Dateien, %s, geholt und gelesen in %ld.%02ld s\n",
+                   l.count, t1, (long)((ticks_now() - t0) / 50),
+                   (long)(((ticks_now() - t0) % 50) * 2));
+        }
+        list_free(&l);
+    } else if (stricmp(sub, "pos") == 0 && argc >= 2) {
+        rc = abs_pick(p, argv[1], &b);
+        if (rc != SUB_OK) {
+            goto out;
+        }
+        if (argc >= 3) {
+            /* Nur zum Pruefen des Abgleichs: Stelle von Hand setzen.
+             * Die Dauer kommt aus der Buecherliste - bei Angabe einer
+             * ID fehlt sie, dann aus den Dateien. */
+            long ms = atol(argv[2]) * 1000L;
+
+            if (b.dur_ms == 0) {
+                struct SubList l;
+
+                list_init(&l, sizeof(struct AbsTrack));
+                rc = abs_tracks(p, b.id, &l, &b.dur_ms);
+                list_free(&l);
+                if (rc != SUB_OK) {
+                    goto out;
+                }
+            }
+            rc = abs_set_pos(p, b.id, ms, b.dur_ms);
+            if (rc != SUB_OK) {
+                goto out;
+            }
+            rc = abs_get_pos(p, b.id, &b.pos_ms, &b.finished);
+            if (rc != SUB_OK) {
+                goto out;
+            }
+            printf("gesetzt, ");
+        }
+        hms(b.pos_ms, t1);
+        printf("Position %s (%ld.%03ld s)%s\n", t1, b.pos_ms / 1000,
+               b.pos_ms % 1000, b.finished ? ", fertig gehoert" : "");
+    } else if (stricmp(sub, "raw") == 0 && argc >= 2) {
+        /* Nie raten, was der Server schickt (AGENTS.md 1): die rohe
+         * Antwort landet in einer Datei, die Laenge auf dem Schirm. */
+        char *resp = NULL;
+        long len = 0;
+        const char *dest = argc >= 3 ? argv[2] : "T:abs.json";
+
+        rc = abs_raw(p, argv[1], &resp, &len);
+        if (rc == SUB_OK) {
+            BPTR fh = Open((STRPTR)dest, MODE_NEWFILE);
+
+            if (fh) {
+                Write(fh, resp, len);
+                Close(fh);
+            }
+            printf("HTTP %d, %ld Bytes -> %s\n", sub_last_http_status(),
+                   len, dest);
+            free(resp);
+        }
+    } else if (stricmp(sub, "play") == 0 && argc >= 2) {
+        rc = abs_pick(p, argv[1], &b);
+        if (rc != SUB_OK) {
+            goto out;
+        }
+        if (b.title[0]) {
+            printf("%s - %s\n", b.author, b.title);
+        }
+        rc = abs_play(p, &b, argc >= 3 ? atol(argv[2]) * 1000L : -1L);
+    } else {
+        printf("abs setup <url> <benutzer> <passwort>   z.B. http://rechner:13378\n"
+               "abs login                       Anmeldung pruefen\n"
+               "abs books                       Buecher mit Hoerposition\n"
+               "abs tracks <nr|id>              Dateien eines Buchs\n"
+               "abs pos <nr|id> [sekunden]      Position lesen / setzen\n"
+               "abs raw <pfad> [datei]          rohe Antwort, Vorgabe T:abs.json\n"
+               "abs play <nr|id> [sekunden]     abspielen, Position abgleichen\n");
+        return 5;
+    }
+
+out:
+    if (rc != SUB_OK) {
+        printf("Fehler: %s\n", abs_last_error());
+        return 10;
+    }
+    return 0;
+}
+
 static int run(int argc, char **argv)
 {
     struct Prefs p;
@@ -790,6 +1271,12 @@ static int run(int argc, char **argv)
 
     if (need_prefs(&p) != SUB_OK) {
         return 10;
+    }
+
+    /* Eigener Server, eigene Fehlertexte - deshalb vor allen anderen
+     * Befehlen und mit eigenem Rueckgabewert. */
+    if (stricmp(cmd, "abs") == 0) {
+        return cmd_abs(&p, argc - 2, argv + 2);
     }
 
     if (stricmp(cmd, "ping") == 0) {

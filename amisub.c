@@ -27,6 +27,16 @@ struct Library *SocketBase = NULL;
 
 static char g_error[256] = "";
 
+/* Status der letzten vollstaendigen HTTP-Antwort. Audiobookshelf sagt
+ * mit 404 "noch nie gehoert" - das ist kein Fehler, sondern Position 0,
+ * und muss sich von einem echten Fehler unterscheiden lassen. */
+static int g_http_status = 0;
+
+int sub_last_http_status(void)
+{
+    return g_http_status;
+}
+
 const char *sub_last_error(void)
 {
     return g_error[0] ? g_error : "no error";
@@ -76,6 +86,53 @@ static int cp_to_ascii(unsigned long cp)
     default:
         return 0;
     }
+}
+
+/* Ein Buchstabe mit nachgestelltem Kombinationszeichen als EIN
+ * Latin-1-Zeichen. macOS legt Dateinamen zerlegt ab ("o" + U+0308 statt
+ * U+00F6), und Audiobookshelf reicht sie so weiter: aus "Stoerung"
+ * wurde "Sto?rung" (gemessen 12.10.2026). Liefert 0, wenn es keine
+ * Latin-1-Entsprechung gibt - dann faellt das Zeichen weg und der
+ * Grundbuchstabe bleibt stehen, was immer noch lesbar ist. */
+static int compose_latin1(int base, unsigned long mark)
+{
+    static const char vow[]  = "AEIOUaeiou";
+    /* Je Vokal: Gravis, Akut, Zirkumflex, Trema (Latin-1) */
+    static const unsigned char grave[] = { 0xc0,0xc8,0xcc,0xd2,0xd9,0xe0,0xe8,0xec,0xf2,0xf9 };
+    static const unsigned char acute[] = { 0xc1,0xc9,0xcd,0xd3,0xda,0xe1,0xe9,0xed,0xf3,0xfa };
+    static const unsigned char circ[]  = { 0xc2,0xca,0xce,0xd4,0xdb,0xe2,0xea,0xee,0xf4,0xfb };
+    static const unsigned char uml[]   = { 0xc4,0xcb,0xcf,0xd6,0xdc,0xe4,0xeb,0xef,0xf6,0xfc };
+    const char *v = strchr(vow, base);
+    int i = v ? (int)(v - vow) : -1;
+
+    switch (mark) {
+    case 0x0300: return i >= 0 ? grave[i] : 0;
+    case 0x0301:
+        if (base == 'y') return 0xfd;
+        if (base == 'Y') return 0xdd;
+        return i >= 0 ? acute[i] : 0;
+    case 0x0302: return i >= 0 ? circ[i] : 0;
+    case 0x0308:
+        if (base == 'y') return 0xff;
+        return i >= 0 ? uml[i] : 0;
+    case 0x0303:
+        if (base == 'n') return 0xf1;
+        if (base == 'N') return 0xd1;
+        if (base == 'a') return 0xe3;
+        if (base == 'A') return 0xc3;
+        if (base == 'o') return 0xf5;
+        if (base == 'O') return 0xd5;
+        return 0;
+    case 0x030a:
+        if (base == 'a') return 0xe5;
+        if (base == 'A') return 0xc5;
+        return 0;
+    case 0x0327:
+        if (base == 'c') return 0xe7;
+        if (base == 'C') return 0xc7;
+        return 0;
+    }
+    return 0;
 }
 
 /* Navidrome liefert UTF-8, der Amiga will Latin-1.
@@ -128,6 +185,16 @@ void utf8_to_latin1(char *s)
 
         if (cp <= 0xff) {
             *w++ = (unsigned char)cp;
+        } else if (cp >= 0x0300 && cp <= 0x036f) {
+            /* Kombinationszeichen: mit dem Buchstaben davor
+             * verschmelzen oder ersatzlos weglassen - nie '?'. */
+            if (w > (unsigned char *)s && w[-1] < 0x80) {
+                int c = compose_latin1(w[-1], cp);
+
+                if (c) {
+                    w[-1] = (unsigned char)c;
+                }
+            }
         } else {
             /* int, nicht char: der Rueckgabewert -1 (unsichtbares
              * Zeichen) traegt sonst nur, solange char vorzeichenbehaftet
@@ -321,6 +388,20 @@ static int prefs_read_file(struct Prefs *p, const char *path)
             copy_field(p->amppath, sizeof(p->amppath), eq + 1);
         } else if (stricmp(line, "folder") == 0) {
             copy_field(p->folder, sizeof(p->folder), eq + 1);
+        } else if (stricmp(line, "absurl") == 0) {
+            int n;
+
+            copy_field(p->absurl, sizeof(p->absurl), eq + 1);
+            /* Ein Schraegstrich am Ende ergaebe "//api/..." - den
+             * nimmt nicht jeder Server an. */
+            n = (int)strlen(p->absurl);
+            while (n > 0 && p->absurl[n - 1] == '/') {
+                p->absurl[--n] = '\0';
+            }
+        } else if (stricmp(line, "absuser") == 0) {
+            copy_field(p->absuser, sizeof(p->absuser), eq + 1);
+        } else if (stricmp(line, "abspassword") == 0) {
+            copy_field(p->abspass, sizeof(p->abspass), eq + 1);
         } else if (stricmp(line, "ahiunit") == 0) {
             p->ahiunit = atoi(eq + 1);
             if (p->ahiunit < 0 || p->ahiunit > 3) {
@@ -419,6 +500,12 @@ static int prefs_write_one(struct Prefs *p, const char *dir)
     FPrintf(fh, "; Verzeichnis mit eigenen MP3-Dateien. Es wird rekursiv\n");
     FPrintf(fh, "; durchsucht; leer heisst: kein eigener Bestand.\n");
     FPrintf(fh, "folder=%s\n", (LONG)(ULONG)p->folder);
+    FPrintf(fh, ";\n");
+    FPrintf(fh, "; Audiobookshelf (Hoerbuecher), eigener Server mit eigenem\n");
+    FPrintf(fh, "; Zugang. absurl leer heisst: nicht eingerichtet.\n");
+    FPrintf(fh, "absurl=%s\n", (LONG)(ULONG)p->absurl);
+    FPrintf(fh, "absuser=%s\n", (LONG)(ULONG)p->absuser);
+    FPrintf(fh, "abspassword=%s\n", (LONG)(ULONG)p->abspass);
     FPrintf(fh, ";\n");
     FPrintf(fh, "; AHI-Unit fuer die Wiedergabe (0 bis 3). Welcher Modus\n");
     FPrintf(fh, "; dahinter liegt, wird in den AHI-Voreinstellungen\n");
@@ -932,8 +1019,13 @@ static int recv_all(struct Conn *c, char **out, long *outlen)
  * Anfrage an den eigenen Navidrome geht: die Liedtexte kommen von
  * lrclib.net, einem voellig anderen Rechner. Prefs wuerde dafuer nur
  * missbraucht. */
-static int http_get_host(const char *host, int port, BOOL https,
-                         const char *path, const char *useragent,
+/* method ist "GET", "POST" oder "PATCH". hdrs sind fertige Kopfzeilen
+ * mit "\r\n" am Ende (z.B. die Anmeldung bei Audiobookshelf) oder NULL.
+ * body ist ein JSON-Rumpf oder NULL - dann gibt es keinen Content-Type. */
+static int http_req_host(const char *host, int port, BOOL https,
+                         const char *method, const char *path,
+                         const char *useragent, const char *hdrs,
+                         const char *body,
                          char **resp_body, long *resp_len)
 {
     struct hostent *he;
@@ -951,6 +1043,7 @@ static int http_get_host(const char *host, int port, BOOL https,
 
     *resp_body = NULL;
     *resp_len = 0;
+    g_http_status = 0;
 
     c.sock = -1;
     c.ssl = NULL;
@@ -1035,7 +1128,11 @@ static int http_get_host(const char *host, int port, BOOL https,
         }
     }
 
-    req = malloc(strlen(path) + strlen(host) + strlen(useragent) + 256);
+    if (!hdrs) {
+        hdrs = "";
+    }
+    req = malloc(strlen(path) + strlen(host) + strlen(useragent) +
+                 strlen(hdrs) + (body ? strlen(body) : 0) + 300);
     if (!req) {
         conn_close(&c);
         return fail(SUB_EMEM, "out of memory");
@@ -1046,21 +1143,25 @@ static int http_get_host(const char *host, int port, BOOL https,
      * vergleichen den Wert mitunter mit ihrer Konfiguration und weisen
      * "host:443" ab, wo sie "host" erwarten. */
     if ((https && port == 443) || (!https && port == 80)) {
-        sprintf(req,
-                "GET %s HTTP/1.0\r\n"
-                "Host: %s\r\n"
-                "User-Agent: %s\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                path, host, useragent);
+        sprintf(req, "%s %s HTTP/1.0\r\nHost: %s\r\n",
+                method, path, host);
     } else {
-        sprintf(req,
-                "GET %s HTTP/1.0\r\n"
-                "Host: %s:%d\r\n"
-                "User-Agent: %s\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                path, host, port, useragent);
+        sprintf(req, "%s %s HTTP/1.0\r\nHost: %s:%d\r\n",
+                method, path, host, port);
+    }
+    sprintf(req + strlen(req),
+            "User-Agent: %s\r\n"
+            "%s"
+            "Connection: close\r\n",
+            useragent, hdrs);
+    if (body) {
+        sprintf(req + strlen(req),
+                "Content-Type: application/json\r\n"
+                "Content-Length: %ld\r\n"
+                "\r\n%s",
+                (long)strlen(body), body);
+    } else {
+        strcat(req, "\r\n");
     }
 
     total = (long)strlen(req);
@@ -1108,6 +1209,7 @@ static int http_get_host(const char *host, int port, BOOL https,
         free(raw);
         return fail(SUB_EHTTP, "no valid HTTP response");
     }
+    g_http_status = status;
 
     hdrend = strstr(raw, "\r\n\r\n");
     if (!hdrend) {
@@ -1143,6 +1245,14 @@ static int http_get_host(const char *host, int port, BOOL https,
     memmove(raw, hdrend, (size_t)*resp_len + 1);
     *resp_body = raw;
     return SUB_OK;
+}
+
+static int http_get_host(const char *host, int port, BOOL https,
+                         const char *path, const char *useragent,
+                         char **resp_body, long *resp_len)
+{
+    return http_req_host(host, port, https, "GET", path, useragent,
+                         NULL, NULL, resp_body, resp_len);
 }
 
 static int http_get(struct Prefs *p, const char *path,
@@ -2468,6 +2578,137 @@ BOOL sub_radio_is_aac(const char *ctype)
     }
     return strnicmp(ctype, "audio/aac", 9) == 0 ||
            strnicmp(ctype, "audio/x-aac", 11) == 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Anfragen an einen zweiten Server (Audiobookshelf)                   */
+/* ------------------------------------------------------------------ */
+
+/* base ist "http://rechner:port" ohne Pfad, path faengt mit '/' an.
+ * Laeuft ueber denselben Weg wie die Navidrome-Anfragen, nur mit Methode,
+ * eigenen Kopfzeilen und JSON-Rumpf. */
+int sub_http_request(const char *base, const char *method, const char *path,
+                     const char *hdrs, const char *body,
+                     char **resp_body, long *resp_len)
+{
+    char host[128];
+    char dummy[8];
+    int port = 80;
+    BOOL https = FALSE;
+    int rc;
+
+    *resp_body = NULL;
+    *resp_len = 0;
+    rc = radio_split(base, host, sizeof(host), &port, &https,
+                     dummy, sizeof(dummy));
+    if (rc != SUB_OK) {
+        return fail(SUB_ENOPREFS, "server address is not an http(s) URL");
+    }
+    return http_req_host(host, port, https, method, path,
+                         SUB_CLIENT "/" SUB_VERSION, hdrs, body,
+                         resp_body, resp_len);
+}
+
+/* Eine Datei als Strom ab Byte offset - wie sub_stream_open, aber an
+ * beliebiger Adresse. Verbunden wird ueber radio_connect(), also OHNE
+ * den Namensmerker des Navidrome-Servers anzufassen.
+ *
+ * HTTP/1.0 mit Range: Audiobookshelf antwortet darauf mit 206 und
+ * Content-Range (gemessen 12.10.2026), und 1.0 heisst nie chunked. */
+int sub_url_stream_open(const char *base, const char *path, long offset,
+                        struct SubStream *st)
+{
+    struct Conn c;
+    char host[128];
+    char dummy[8];
+    char req[1100];
+    char head[1500];
+    char val[64];
+    int port = 80;
+    BOOL https = FALSE;
+    int rc, status = 0;
+    long n, sent, total;
+
+    memset(st, 0, sizeof(*st));
+    st->sock = -1;
+
+    if (strlen(path) > 900) {
+        return fail(SUB_EHTTP, "request path too long");
+    }
+    rc = net_ensure();
+    if (rc != SUB_OK) {
+        return rc;
+    }
+    rc = radio_split(base, host, sizeof(host), &port, &https,
+                     dummy, sizeof(dummy));
+    if (rc != SUB_OK) {
+        return fail(SUB_ENOPREFS, "server address is not an http(s) URL");
+    }
+    rc = radio_connect(host, port, https, &c);
+    if (rc != SUB_OK) {
+        return rc;
+    }
+
+    if (port == (https ? 443 : 80)) {
+        sprintf(req, "GET %s HTTP/1.0\r\nHost: %s\r\n", path, host);
+    } else {
+        sprintf(req, "GET %s HTTP/1.0\r\nHost: %s:%d\r\n",
+                path, host, port);
+    }
+    sprintf(req + strlen(req),
+            "User-Agent: %s/" SUB_VERSION "\r\n"
+            "Range: bytes=%ld-\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            SUB_CLIENT, offset);
+
+    total = (long)strlen(req);
+    sent = 0;
+    while (sent < total) {
+        n = conn_send(&c, req + sent, total - sent);
+        if (n <= 0) {
+            conn_close(&c);
+            return fail(SUB_ENET, "could not send request");
+        }
+        sent += n;
+    }
+
+    radio_read_head(&c, head, sizeof(head));
+    if (sscanf(head, "HTTP/%*d.%*d %d", &status) != 1) {
+        conn_close(&c);
+        return fail(SUB_EHTTP, "no valid HTTP response");
+    }
+    g_http_status = status;
+    if (status != 200 && status != 206) {
+        char msg[96];
+
+        sprintf(msg, "file rejected, HTTP %d", status);
+        conn_close(&c);
+        return fail(SUB_EHTTP, msg);
+    }
+
+    /* Gesamtlaenge wie in sub_stream_open: bei 206 hinter dem
+     * Schraegstrich im Content-Range, bei 200 im Content-Length. */
+    if (head_field(head, "content-range", val, sizeof(val))) {
+        char *slash = strchr(val, '/');
+
+        if (slash) {
+            st->total = atol(slash + 1);
+        }
+    } else if (status == 200) {
+        if (head_field(head, "content-length", val, sizeof(val))) {
+            st->total = atol(val);
+        }
+        offset = 0;             /* Range uebergangen: von vorn */
+    }
+    if (head_field(head, "content-type", val, sizeof(val))) {
+        copy_field(st->ctype, sizeof(st->ctype), val);
+    }
+
+    st->sock = c.sock;
+    st->ssl  = c.ssl;
+    st->pos  = offset;
+    return SUB_OK;
 }
 
 /* Prueft, ob der Server mitten im Titel einsteigen laesst.

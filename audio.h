@@ -61,6 +61,14 @@ void audio_clear_done(void);
  * darf also jederzeit aus der Oberflaeche gerufen werden. */
 BOOL audio_vis_window(WORD *mono, LONG n);
 
+/* Erster echter MP3-Rahmen in b (Versatz), -1 wenn keiner sicher ist.
+ * Nach einem Sprung mitten in eine Datei PFLICHT: mpega.library nimmt
+ * das erste 0xFF-Synchronwort, und das liegt meist mitten in den
+ * Audiodaten - dann meldet MPEGA_open "kein MPEG" (gemessen 12.10.2026).
+ * Echt ist ein Kopf erst, wenn eine Rahmenlaenge weiter der naechste
+ * steht. */
+LONG mp3_find_frame(const UBYTE *b, LONG n);
+
 /* Dekodiert eine Datei vollstaendig, ohne sie auszugeben, und misst die
  * Zeit. Kein AHI, kein Netz - nur der Dekoder. */
 BOOL audio_probe_file(const char *path, struct AudioProbe *out);
