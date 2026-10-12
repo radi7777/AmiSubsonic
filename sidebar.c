@@ -60,6 +60,13 @@ static const struct Entry g_entries[] = {
     { "Albums",      E_ITEM, SB_FOLDER_ALBUMS },
     { "Tracks",      E_ITEM, SB_FOLDER_TRACKS },
     { "",            E_GAP,  -1 },
+
+    /* Hoerbuecher von einem Audiobookshelf-Server. Nur ein Eintrag:
+     * das Weiterhoeren steckt im Klick auf das Buch (Wunsch des
+     * Anwenders, 12.10.2026). */
+    { "Audiobookshelf", E_HEAD, -1 },
+    { "Books",       E_ITEM, SB_ABS_BOOKS },
+    { "",            E_GAP,  -1 },
     { "Scan",        E_ITEM, SB_SCAN },
     { "Settings",    E_ITEM, SB_SETTINGS },
 };

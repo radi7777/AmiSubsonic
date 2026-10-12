@@ -60,7 +60,16 @@ enum {
      * weiter geblaettert und nachgeladen werden. */
     NJ_SCAN,            /* eigenes Verzeichnis rekursiv durchsuchen */
     NJ_STREAM,          /* Titel in den Ring holen (id, offset, out_ring) */
-    NJ_STREAM_STOP      /* laufenden Strom beenden */
+    NJ_STREAM_STOP,     /* laufenden Strom beenden */
+
+    /* Audiobookshelf. Hinten angehaengt, damit sich die Nummern davor
+     * nicht verschieben. */
+    NJ_ABS_BOOKS,       /* alle Buecher mit Position (out_list: AbsBook) */
+    NJ_ABS_BOOK,        /* Dateien eines Buchs (id, out_list: AbsTrack)
+                         * und die FRISCHE Position (pos_ms) - auf einem
+                         * anderen Geraet kann seit der Buecherliste
+                         * weitergehoert worden sein */
+    NJ_ABS_SYNC         /* Position zurueckschreiben (id, pos_ms, dur_ms) */
 };
 
 struct NetJob {
@@ -86,6 +95,14 @@ struct NetJob {
 
     /* NJ_TRACKS: ab welchem Titel die Seite anfaengt. */
     int   offset;
+
+    /* Audiobookshelf. Bei NJ_STREAM steht in id das Buch und in ino die
+     * Datei; skip sind Bytes, die NACH dem ID3-Etikett noch zu
+     * ueberspringen sind (Einstieg mitten in die Datei - die Laenge des
+     * Etiketts kennt vorher keiner). */
+    char  ino[16];
+    long  skip;
+    long  pos_ms, dur_ms;
 
     /* Ausgaben. Die Strukturen gehoeren dem Auftraggeber; der
      * Arbeitsprozess fuellt sie und fasst sie danach nicht mehr an. */

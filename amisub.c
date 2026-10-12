@@ -2173,7 +2173,10 @@ int sub_stream_open(struct Prefs *p, const char *songid, long offset,
             break;
         }
         if (n < 0 && Errno() == SUB_EWOULDBLOCK) {
-            continue;
+            /* Warten statt drehen - siehe sub_stream_read(). */
+            if (sock_wait(c.sock, FALSE, SUB_IO_SECS) > 0) {
+                continue;
+            }
         }
         break;
     }
@@ -2244,7 +2247,20 @@ long sub_stream_read(struct SubStream *st, void *buf, long len)
             return (st->total > 0 && st->pos < st->total) ? -1 : 0;
         }
         if (n < 0 && Errno() == SUB_EWOULDBLOCK) {
-            continue;
+            /* Ohne TLS ist der Socket nicht blockierend: "noch nichts
+             * da" kommt sofort zurueck. Hier stand nur continue - eine
+             * Schleife auf voller Drehzahl. Navidrome und die Sender
+             * laufen ueber HTTPS und kamen nie hierher; Audiobookshelf
+             * im LAN (http) schon, und der Netzprozess frass die
+             * Maschine: TCP-Stack und amiagent kamen nicht mehr dran,
+             * kein Abgleich ging hinaus (12.10.2026). Also WARTEN, bis
+             * etwas da ist - mit Zeitgrenze. */
+            int w = sock_wait(c.sock, FALSE, SUB_IO_SECS);
+
+            if (w > 0) {
+                continue;
+            }
+            return -1;          /* Zeitgrenze oder Fehler: neu ansetzen */
         }
         return (n == 0) ? 0 : -1;
     }
@@ -2387,7 +2403,12 @@ static long radio_read_head(struct Conn *c, char *head, long size)
             break;
         }
         if (n < 0 && Errno() == SUB_EWOULDBLOCK) {
-            continue;
+            /* Wie in sub_stream_read: warten, nicht drehen. Sonst waren
+             * die 4000 Runden bei einem langsamen Server aufgebraucht,
+             * bevor der Kopf ueberhaupt da war. */
+            if (sock_wait(c->sock, FALSE, SUB_IO_SECS) > 0) {
+                continue;
+            }
         }
         break;
     }
@@ -2843,7 +2864,10 @@ int sub_range_probe(struct Prefs *p, const char *songid, long offset,
                 break;
             }
             if (n < 0 && Errno() == SUB_EWOULDBLOCK) {
-                continue;
+                /* Warten statt drehen - siehe sub_stream_read(). */
+                if (sock_wait(c.sock, FALSE, SUB_IO_SECS) > 0) {
+                    continue;
+                }
             }
             break;
         }

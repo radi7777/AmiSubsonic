@@ -38,6 +38,8 @@
 #define SB_FOLDER_TRACKS  6
 #define SB_SCAN           7
 #define SB_SETTINGS       8
+/* Hoerbuecher (Audiobookshelf), als Bildwand. */
+#define SB_ABS_BOOKS      9
 
 /* Kein Eintrag markiert. Die Playeransicht ist kein Punkt der
  * Gliederung - waehrend sie offen ist, soll die Leiste nicht behaupten,

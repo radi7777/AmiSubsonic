@@ -54,6 +54,7 @@
 #include "player.h"
 #include "netjob.h"
 #include "local.h"
+#include "abs.h"
 
 /* MUIA_Dtpic_Name steht nicht in den MUI-3.8-Headern - die Klasse kam
  * erst mit MUI 4. Das hier installierte muimaster.library 19.35 bringt
@@ -271,6 +272,43 @@ static int   g_rthumb_count = 0;
 static int   g_rfill        = 0;        /* naechster zu holender Sender */
 static BOOL  g_rcover_job   = FALSE;    /* Cover-Auftrag fuer einen Sender */
 
+/* HOERBUECHER (Audiobookshelf). Eine eigene Bildwand wie Folder/Albums:
+ * g_abooks ist die Liste vom Server, g_abalbums dieselbe Reihe als
+ * Album-Eintraege fuer die Bildwand (index-gleich), g_athumbs die
+ * Miniaturen dazu. */
+static struct SubList     g_abooks;
+static struct SubList     g_abalbums;
+static struct AlbumThumb *g_athumbs = NULL;
+static BOOL  g_abs_seen     = FALSE;    /* Ansicht schon einmal geholt */
+static BOOL  g_abs_list_job = FALSE;    /* Buecherliste unterwegs */
+static BOOL  g_want_abooks  = FALSE;    /* Buecherliste nachholen */
+static int   g_afill        = -1;       /* naechste Miniatur */
+static BOOL  g_acover_job   = FALSE;    /* Cover-Auftrag fuer ein Buch */
+
+/* Das geoeffnete Buch: seine Dateien kommen vom Netzprozess in
+ * g_abs_tracks und werden in g_songs umkopiert - danach laeuft alles
+ * Weitere (Liste, Warteschlange, Bedienleiste) wie bei einem Album. */
+static struct SubList g_abs_tracks;
+static struct AbsBook g_abs_open;
+static BOOL  g_abs_book_job  = FALSE;
+static BOOL  g_abs_book_play = FALSE;   /* nach dem Laden gleich spielen */
+static int   g_want_abook    = -1;      /* Klick, der warten musste */
+static BOOL  g_want_abook_play = FALSE;
+static long  g_abs_qdur      = 0;       /* Dauer des Buchs in der Schlange */
+
+/* DER ABGLEICH. Die Stelle im Buch geht alle 30 s an den Server, dazu
+ * bei Pause, Stop, Sprung, Wechsel und beim Beenden - auf einem anderen
+ * Geraet soll man dort weiterhoeren koennen. Weil immer nur EIN
+ * Netzauftrag laufen darf, wird eine faellige Meldung hier vorgemerkt
+ * und abgeschickt, sobald die Bahn frei ist (abs_sync_step). */
+static BOOL  g_abs_due      = FALSE;
+static char  g_abs_due_item[SUB_ID_LEN];
+static long  g_abs_due_pos  = 0;
+static long  g_abs_due_dur  = 0;
+static BOOL  g_abs_sync_job = FALSE;
+static int   g_abs_ticks    = 0;
+#define ABS_SYNC_SECS  30
+
 static const char *view_type(int v)
 {
     /* "frequent" ist bei Subsonic die Liste nach Abspielhaeufigkeit. */
@@ -398,6 +436,7 @@ static Object *lst_favs;        /* die Ansicht "Favorites" */
 static Object *lst_radio;       /* die Ansicht "Radio" */
 static Object *lst_folder;      /* Folder/Tracks: eigene Dateien */
 static Object *grid_folder;     /* Folder/Albums: eigene Alben */
+static Object *grid_abs;        /* Audiobookshelf/Books */
 
 /* Das Einstellfenster. Als einziges Fenster dieses Programms besteht es
  * aus MUI-BORDMITTELN - Stringfelder, Ankreuzfeld, Knoepfe. Das ist
@@ -408,6 +447,7 @@ static Object *str_host, *str_user, *str_pass;
 static Object *chk_screen, *txt_mode;
 static Object *cyc_ahi;
 static Object *str_folder, *btn_folder;
+static Object *str_absurl, *str_absuser, *str_abspass;
 
 /* Fuer das Zykelfeld. MUSS ein Feld von Zeigern sein, das bis zum Ende
  * des Programms lebt - MUI kopiert die Liste nicht. */
@@ -446,6 +486,7 @@ static Object *visual;           /* dritter Reiter: VISUALIZER */
 #define PAGE_RADIO   4
 #define PAGE_FOLDER  5          /* eigene Titel, Liste */
 #define PAGE_FALBUMS 6          /* eigene Alben, Bildwand */
+#define PAGE_ABS     7          /* Hoerbuecher, Bildwand */
 
 #define ID_QUIT        1
 #define ID_SIDEBAR     2
@@ -461,6 +502,7 @@ static Object *visual;           /* dritter Reiter: VISUALIZER */
 #define ID_SET_FOLDER 14
 #define ID_FALBUM_PICK 15
 #define ID_FOLDER_PICK 16
+#define ID_ABOOK_PICK  17
 #define ID_TAB         9
 #define ID_PLAYER     10
 
@@ -701,6 +743,13 @@ static void strip_timestamps(char *s)
 
 static void lyrics_request(struct Song *s)
 {
+    /* Ein Hoerbuch hat keinen Liedtext - und weder Navidrome noch
+     * lrclib kennen seine Dateien. Die Anfrage waere nur Netzlast. */
+    if (s && s->absitem[0]) {
+        strcpy(g_lyrics, "\n  (audiobook)");
+        DoMethod(ft_lyrics, MUIM_TL_SetText, (ULONG)g_lyrics);
+        return;
+    }
     if (!s || net_busy()) {
         return;
     }
@@ -983,6 +1032,53 @@ static void now_cover_late(const char *id, const char *path)
     set(player, MUIA_Pl_Cover, (ULONG)g_now_cover);
 }
 
+/* Die Stelle im BUCH, die gerade zu hoeren ist, oder -1 (kein
+ * Hoerbuch, oder es steht). */
+static long abs_now_pos(void)
+{
+    if (!g_now_ok || !g_now.absitem[0] || g_radio_on) {
+        return -1;
+    }
+    if (audio_state() == AU_STOPPED) {
+        return -1;
+    }
+    return g_now.abs_start_ms + (long)audio_pos_ms();
+}
+
+/* Die laufende Stelle zum Abgleich vormerken. Gerufen VOR allem, was
+ * die Stelle veraendert (Stop, Wechsel) - danach waere sie weg. */
+static void abs_note(void)
+{
+    long pos = abs_now_pos();
+
+    if (pos < 0) {
+        return;
+    }
+    strcpy(g_abs_due_item, g_now.absitem);
+    g_abs_due_pos = pos;
+    g_abs_due_dur = g_abs_qdur;
+    g_abs_due = TRUE;
+}
+
+/* Eine vorgemerkte Stelle abschicken, sobald kein anderer Auftrag
+ * laeuft. Aus tick() und wants_step() - also spaetestens eine Sekunde
+ * nach dem Vormerken, wenn die Bahn frei ist. */
+static void abs_sync_step(void)
+{
+    if (!g_abs_due || g_abs_sync_job || net_busy()) {
+        return;
+    }
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.op = NJ_ABS_SYNC;
+    strcpy(g_job.id, g_abs_due_item);
+    g_job.pos_ms = g_abs_due_pos;
+    g_job.dur_ms = g_abs_due_dur;
+    if (net_submit(&g_job)) {
+        g_abs_sync_job = TRUE;
+        g_abs_due = FALSE;
+    }
+}
+
 /* Den Strom fuer einen Titel anfangen lassen.
  *
  * start_ms > 0 heisst: mitten im Titel einsteigen. Die Stelle wird in
@@ -998,6 +1094,10 @@ static int stream_start(int qidx, LONG start_ms)
         say("no audio buffer - is the audio process running?");
         return 0;
     }
+
+    /* Lief bis eben ein Hoerbuch, geht seine Stelle jetzt an den
+     * Server - nach dem Halt waere sie verloren. */
+    abs_note();
 
     audio_halt();                   /* was noch laeuft, beenden */
     net_stream_end();
@@ -1032,6 +1132,20 @@ static int stream_start(int qidx, LONG start_ms)
             sizeof(g_sjobs[0].path) - 1);
     g_sjobs[g_sjob_cur].offset = (int)off;
     g_sjobs[g_sjob_cur].out_ring = &g_rings[g_ring_cur];
+
+    /* Hoerbuch: Buch und Datei statt Titel-ID. Der Sprung geht ueber
+     * skip, weil erst der Netzprozess die Laenge des ID3-Etiketts
+     * kennt; feste Bitrate, wie gemessen (128 kbps), also kbit/s mal ms
+     * durch 8 Bytes. */
+    if (g_queue[qidx].absitem[0]) {
+        strncpy(g_sjobs[g_sjob_cur].id, g_queue[qidx].absitem,
+                SUB_ID_LEN - 1);
+        strncpy(g_sjobs[g_sjob_cur].ino, g_queue[qidx].id,
+                sizeof(g_sjobs[0].ino) - 1);
+        g_sjobs[g_sjob_cur].offset = 0;
+        g_sjobs[g_sjob_cur].skip = (start_ms > 0)
+            ? (long)g_queue[qidx].bitrate * (long)start_ms / 8L : 0;
+    }
     if (!net_submit_stream(&g_sjobs[g_sjob_cur])) {
         say("cannot start stream");
         return 0;
@@ -1042,18 +1156,25 @@ static int stream_start(int qidx, LONG start_ms)
 }
 
 /* Einen Titel der Warteschlange abspielen. Der einzige Weg, auf dem in
- * diesem Programm Musik anfaengt. */
-static void play_queue(int qidx)
+ * diesem Programm Musik anfaengt. start_ms > 0 nur beim Hoerbuch: dort
+ * geht es an der gemerkten Stelle weiter. */
+static void play_queue_at(int qidx, LONG start_ms)
 {
     if (qidx < 0 || qidx >= g_qcount) {
         return;
     }
-    if (!stream_start(qidx, 0)) {
+    if (!stream_start(qidx, start_ms)) {
         return;
     }
     g_radio_on = FALSE;             /* ab jetzt wieder Warteschlange */
     set(lst_radio, MUIA_TL_Playing, -1);
     now_from_queue(qidx);
+    g_abs_ticks = 0;                /* naechster Abgleich in 30 s */
+}
+
+static void play_queue(int qidx)
+{
+    play_queue_at(qidx, 0);
 }
 
 /* Aus der sichtbaren Liste heraus starten: sie wird zur Warteschlange. */
@@ -2227,6 +2348,9 @@ static void prefs_open(void)
         }
     }
     set(str_folder, MUIA_String_Contents, (ULONG)g_prefs.folder);
+    set(str_absurl,  MUIA_String_Contents, (ULONG)g_prefs.absurl);
+    set(str_absuser, MUIA_String_Contents, (ULONG)g_prefs.absuser);
+    set(str_abspass, MUIA_String_Contents, (ULONG)g_prefs.abspass);
     set(chk_screen, MUIA_Selected, g_prefs.ownscreen ? TRUE : FALSE);
     mode_text();
 
@@ -2294,6 +2418,25 @@ static void data_reset(void)
     g_track_seen   = FALSE;
     g_fav_seen     = FALSE;
     g_radio_seen   = FALSE;
+
+    /* Die Hoerbuecher. Die geoeffnete Dateiliste bleibt: sie steht als
+     * Kopie in g_songs. Laeuft gerade die Buecherliste, gehoert sie dem
+     * Netzprozess - dann nichts anfassen, nur neu holen lassen. */
+    if (g_abs_list_job) {
+        g_abs_seen = FALSE;
+        return;
+    }
+    DoMethod(grid_abs, MUIM_AG_SetList, (ULONG)NULL, (ULONG)NULL);
+    if (g_athumbs) {
+        lthumbs_free(g_athumbs, g_abalbums.count);
+        g_athumbs = NULL;
+    }
+    g_afill = -1;
+    list_free(&g_abalbums);
+    list_init(&g_abalbums, sizeof(struct Album));
+    list_free(&g_abooks);
+    list_init(&g_abooks, sizeof(struct AbsBook));
+    g_abs_seen = FALSE;
 }
 
 /* Nach einer Aenderung am Zugang: alles weg und von vorn. Erst der
@@ -2317,6 +2460,7 @@ static void radios_request(void);
  * uebrigen Ansichten holen sich ihres beim naechsten Besuch, sie stehen
  * ja jetzt alle wieder auf "noch nicht geholt". */
 static void folder_request(void);
+static void abs_books_request(void);
 
 static void rescan(void)
 {
@@ -2355,6 +2499,12 @@ static void rescan(void)
     case PAGE_RADIO:
         g_radio_seen = TRUE;
         radios_request();
+        break;
+    case PAGE_ABS:
+        if (g_prefs.absurl[0]) {
+            g_abs_seen = TRUE;
+            abs_books_request();
+        }
         break;
     default:
         /* Bildwand oder Playeransicht: die sichtbare Albenliste. */
@@ -2423,6 +2573,45 @@ static void prefs_apply(void)
          * Er wird beim naechsten Besuch von Folder neu durchsucht. */
         if (strcmp(old, g_prefs.folder) != 0) {
             g_local_seen = FALSE;
+        }
+    }
+    {
+        /* Audiobookshelf: ein anderer Zugang heisst, die Buecher gelten
+         * nicht mehr. Sie werden beim naechsten Besuch neu geholt; der
+         * Netzprozess meldet sich dabei von selbst neu an (sein Token
+         * passt nicht mehr und bekommt 401). */
+        char ou[128], ous[64], op[128];
+        int n;
+
+        strcpy(ou, g_prefs.absurl);
+        strcpy(ous, g_prefs.absuser);
+        strcpy(op, g_prefs.abspass);
+        get(str_absurl, MUIA_String_Contents, &t);
+        if (t) {
+            strncpy(g_prefs.absurl, (const char *)t,
+                    sizeof(g_prefs.absurl) - 1);
+            g_prefs.absurl[sizeof(g_prefs.absurl) - 1] = 0;
+            n = (int)strlen(g_prefs.absurl);
+            while (n > 0 && g_prefs.absurl[n - 1] == '/') {
+                g_prefs.absurl[--n] = 0;
+            }
+        }
+        get(str_absuser, MUIA_String_Contents, &t);
+        if (t) {
+            strncpy(g_prefs.absuser, (const char *)t,
+                    sizeof(g_prefs.absuser) - 1);
+            g_prefs.absuser[sizeof(g_prefs.absuser) - 1] = 0;
+        }
+        get(str_abspass, MUIA_String_Contents, &t);
+        if (t) {
+            strncpy(g_prefs.abspass, (const char *)t,
+                    sizeof(g_prefs.abspass) - 1);
+            g_prefs.abspass[sizeof(g_prefs.abspass) - 1] = 0;
+        }
+        if (strcmp(ou, g_prefs.absurl) != 0 ||
+            strcmp(ous, g_prefs.absuser) != 0 ||
+            strcmp(op, g_prefs.abspass) != 0) {
+            g_abs_seen = FALSE;
         }
     }
     get(chk_screen, MUIA_Selected, &sel);
@@ -2834,6 +3023,309 @@ static void tracks_show(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Hoerbuecher (Audiobookshelf)                                        */
+/* ------------------------------------------------------------------ */
+
+/* Die Buecherliste anfordern. Bildwand und Miniaturen gehoeren
+ * waehrend des Auftrags niemandem - erst abhaengen, dann freigeben,
+ * dann neu anlegen lassen (dieselbe Regel wie bei den Alben). */
+static void abs_books_request(void)
+{
+    if (net_busy()) {
+        g_want_abooks = TRUE;
+        return;
+    }
+    g_want_abooks = FALSE;
+
+    DoMethod(grid_abs, MUIM_AG_SetList, (ULONG)NULL, (ULONG)NULL);
+    if (g_athumbs) {
+        lthumbs_free(g_athumbs, g_abalbums.count);
+        g_athumbs = NULL;
+    }
+    g_afill = -1;
+    list_free(&g_abalbums);
+    list_init(&g_abalbums, sizeof(struct Album));
+    list_free(&g_abooks);
+    list_init(&g_abooks, sizeof(struct AbsBook));
+
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.op = NJ_ABS_BOOKS;
+    g_job.out_list = &g_abooks;
+    if (net_submit(&g_job)) {
+        g_abs_list_job = TRUE;
+        say("loading books ...");
+    }
+}
+
+/* "36%" fuer die dritte Zeile unter dem Cover. */
+static void abs_note_text(const struct AbsBook *b, char *out)
+{
+    if (b->finished) {
+        strcpy(out, "finished");
+    } else if (b->pos_ms <= 0 || b->dur_ms <= 0) {
+        strcpy(out, "not started");
+    } else {
+        /* Erst die Dauer kleiner machen: pos*100 laeuft bei einem
+         * elfstuendigen Buch (4e7 ms) nicht ueber, aber sicher ist
+         * sicher - und auf ein Prozent kommt es nicht an. */
+        sprintf(out, "%ld%%", b->pos_ms / (b->dur_ms / 100 + 1));
+    }
+}
+
+/* Die Liste ist da: Bildwand aufbauen, Cover kommen danach. */
+static void abs_books_fill(void)
+{
+    int i;
+    char msg[64];
+
+    g_abs_list_job = FALSE;
+    for (i = 0; i < g_abooks.count; i++) {
+        struct AbsBook *b = (struct AbsBook *)list_get(&g_abooks, i);
+        struct Album *a = (struct Album *)list_add(&g_abalbums);
+
+        if (!b || !a) {
+            break;
+        }
+        strncpy(a->id, b->id, sizeof(a->id) - 1);
+        strncpy(a->name, b->title, sizeof(a->name) - 1);
+        strncpy(a->artist, b->author, sizeof(a->artist) - 1);
+        a->duration = (int)(b->dur_ms / 1000);
+        a->songcount = b->ntracks;
+        abs_cover_id(b->id, a->coverart);
+        abs_note_text(b, a->note);
+    }
+    if (g_abalbums.count > 0) {
+        g_athumbs = calloc((size_t)g_abalbums.count,
+                           sizeof(struct AlbumThumb));
+    }
+    DoMethod(grid_abs, MUIM_AG_SetList,
+             (ULONG)&g_abalbums, (ULONG)g_athumbs);
+    g_afill = (g_abalbums.count > 0 && g_athumbs) ? 0 : -1;
+
+    sprintf(msg, "%d books", g_abalbums.count);
+    say(msg);
+}
+
+/* Eine Miniatur aus dem Cache in die Bildwand. */
+static void athumb_load(int idx, const char *path)
+{
+    struct CoverImage img;
+    UBYTE *rgb = NULL;
+    LONG w = 0, h = 0;
+
+    if (idx < 0 || idx >= g_abalbums.count || !g_athumbs) {
+        return;
+    }
+    if (cover_load(path, &img)) {
+        if (cover_scale_rgb(&img, AG_THUMB_SIZE, FALSE, &rgb, &w, &h)) {
+            g_athumbs[idx].rgb = rgb;
+            g_athumbs[idx].w   = w;
+            g_athumbs[idx].h   = h;
+        }
+        cover_unload(&img);
+    }
+    DoMethod(grid_abs, MUIM_AG_Refresh);
+}
+
+/* Ein Schritt beim Fuellen der Buecherwand. Liegt das Cover im Cache,
+ * wird es gleich geladen (TRUE: es wurde gearbeitet). Sonst geht EIN
+ * Abruf an den Netzprozess - hoechstens einer je Sekunde, dieselbe
+ * Bremse wie bei den Alben (g_fill_token). */
+static BOOL abs_thumbs_step(void)
+{
+    struct Album *a;
+    char path[256];
+
+    if (g_afill < 0 || !g_athumbs || g_afill >= g_abalbums.count
+            || g_acover_job) {
+        return FALSE;
+    }
+    a = (struct Album *)list_get(&g_abalbums, g_afill);
+    if (a && cache_have(&g_prefs, a->coverart)) {
+        cache_path(&g_prefs, a->coverart, path, sizeof(path));
+        athumb_load(g_afill, path);
+        if (++g_afill >= g_abalbums.count) {
+            g_afill = -1;
+        }
+        return TRUE;
+    }
+    if (!a || !g_fill_token || net_busy()) {
+        return FALSE;
+    }
+    g_fill_token = FALSE;
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.op = NJ_COVER;
+    strcpy(g_job.id, a->coverart);
+    g_job.size = 300;
+    if (net_submit(&g_job)) {
+        g_acover_job = TRUE;
+    }
+    return FALSE;
+}
+
+/* Die Ansicht Audiobookshelf/Books. */
+static void abs_books_show(void)
+{
+    show_page(PAGE_ABS);
+
+    if (!g_prefs.absurl[0]) {
+        say("no Audiobookshelf server set - see Settings");
+        return;
+    }
+    if (!g_abs_seen) {
+        g_abs_seen = TRUE;
+        abs_books_request();
+    }
+}
+
+/* Ein Buch oeffnen. play = TRUE: gleich an der Stelle vom Server
+ * weiterspielen (der Klick in der Bildwand), FALSE: nur zeigen (der
+ * Klick auf die Miniatur unten, waehrend es schon laeuft). */
+static void abs_open(const struct AbsBook *b, BOOL play)
+{
+    char cov[SUB_ID_LEN];
+    char path[256];
+
+    g_abs_open = *b;
+    show_page(PAGE_PLAYER);
+
+    set(panel, MUIA_Panel_Title,  (ULONG)g_abs_open.title);
+    set(panel, MUIA_Panel_Artist, (ULONG)g_abs_open.author);
+    set(panel, MUIA_Panel_Album,  (ULONG)"Audiobook");
+    abs_cover_id(g_abs_open.id, cov);
+    if (cache_have(&g_prefs, cov)) {
+        cache_path(&g_prefs, cov, path, sizeof(path));
+        strncpy(g_coverpath, path, sizeof(g_coverpath) - 1);
+        g_coverpath[sizeof(g_coverpath) - 1] = '\0';
+        cover_ready(g_coverpath);
+    }
+
+    /* Die Dateiliste ist malloc - verboten, solange ein Auftrag
+     * laeuft. Dann merken, wants_step() holt es nach. */
+    if (net_busy()) {
+        g_want_abook = 1;
+        g_want_abook_play = play;
+        say("just a moment ...");
+        return;
+    }
+    g_want_abook = -1;
+
+    list_free(&g_abs_tracks);
+    list_init(&g_abs_tracks, sizeof(struct AbsTrack));
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.op = NJ_ABS_BOOK;
+    strcpy(g_job.id, g_abs_open.id);
+    g_job.out_list = &g_abs_tracks;
+    if (net_submit(&g_job)) {
+        g_abs_book_job = TRUE;
+        g_abs_book_play = play;
+        say("opening book ...");
+    }
+}
+
+/* Die Dateien sind da - und die FRISCHE Stelle vom Server. */
+static void abs_book_fill(struct NetJob *j)
+{
+    int i, k = 0;
+    long in_ms = 0;
+    char msg[96], t1[16], t2[16];
+
+    g_abs_book_job = FALSE;
+    g_abs_open.pos_ms = j->pos_ms;
+    g_abs_open.dur_ms = j->dur_ms;
+
+    DoMethod(lst_queue, MUIM_TL_SetList, (ULONG)NULL);
+    list_free(&g_songs);
+    list_init(&g_songs, sizeof(struct Song));
+
+    for (i = 0; i < g_abs_tracks.count; i++) {
+        struct AbsTrack *t = (struct AbsTrack *)list_get(&g_abs_tracks, i);
+        struct Song *sg = (struct Song *)list_add(&g_songs);
+        char *dot;
+
+        if (!t || !sg) {
+            break;
+        }
+        /* Die Datei heisst wie das Kapitel - ohne ".mp3" dahinter. */
+        strncpy(sg->title, t->title, sizeof(sg->title) - 1);
+        dot = strrchr(sg->title, '.');
+        if (dot && strlen(dot) <= 5) {
+            strncpy(sg->suffix, dot + 1, sizeof(sg->suffix) - 1);
+            *dot = '\0';
+        } else {
+            strcpy(sg->suffix, "mp3");
+        }
+        strncpy(sg->id, t->ino, sizeof(sg->id) - 1);
+        strncpy(sg->artist, g_abs_open.author, sizeof(sg->artist) - 1);
+        strncpy(sg->album, g_abs_open.title, sizeof(sg->album) - 1);
+        abs_cover_id(g_abs_open.id, sg->coverart);
+        strcpy(sg->absitem, g_abs_open.id);
+        sg->abs_start_ms = t->start_ms;
+        /* Aufrunden: eine Datei von 18,8 s soll nicht als 0:18 enden,
+         * bevor sie zu Ende ist. */
+        sg->duration = (int)((t->dur_ms + 999) / 1000);
+        sg->bitrate  = (int)(t->bitrate / 1000);
+        sg->track    = i + 1;
+        sg->lalbum   = -1;
+    }
+    DoMethod(lst_queue, MUIM_TL_SetList, (ULONG)&g_songs);
+    g_cur_album[0] = '\0';
+
+    /* Wo steht man? Hinter dem Ende (fertig gehoert): von vorn. */
+    if (g_abs_open.pos_ms > 0 && g_abs_open.pos_ms < g_abs_open.dur_ms - 2000) {
+        for (k = 0; k < g_songs.count; k++) {
+            struct Song *sg = (struct Song *)list_get(&g_songs, k);
+
+            if (g_abs_open.pos_ms < sg->abs_start_ms + (long)sg->duration * 1000L) {
+                in_ms = g_abs_open.pos_ms - sg->abs_start_ms;
+                break;
+            }
+        }
+        if (k >= g_songs.count) {
+            k = 0;
+            in_ms = 0;
+        }
+    }
+
+    duration_text((int)(g_abs_open.pos_ms / 1000), t1, sizeof(t1));
+    duration_text((int)(g_abs_open.dur_ms / 1000), t2, sizeof(t2));
+
+    if (!g_abs_book_play) {
+        mark_playing();
+        if (g_playing >= 0) {
+            set(lst_queue, MUIA_TL_Active, g_playing);
+        }
+        sprintf(msg, "%d chapters - at %s of %s", g_songs.count, t1, t2);
+        say(msg);
+        return;
+    }
+
+    queue_from_songs();
+    g_abs_qdur = g_abs_open.dur_ms;
+    if (k >= g_qcount) {
+        /* Mehr Dateien, als die Warteschlange fasst (QUEUE_MAX). */
+        sprintf(msg, "book has %d files - only %d fit the queue",
+                g_songs.count, QUEUE_MAX);
+        say(msg);
+        return;
+    }
+    play_queue_at(k, (LONG)in_ms);
+    panel_show_now();
+    sprintf(msg, "continuing at %s of %s", t1, t2);
+    say(msg);
+}
+
+/* Klick in der Buecherwand. */
+static void abs_pick(int idx)
+{
+    struct AbsBook *b = (struct AbsBook *)list_get(&g_abooks, idx);
+
+    if (b) {
+        abs_open(b, TRUE);
+    }
+}
+
 /* Auf eine Ansicht der Bildwand umschalten.
  *
  * Ist sie schon einmal geholt worden, steht sie sofort da - Liste und
@@ -3033,6 +3525,19 @@ static void wants_step(void)
         album_request_id(id);
     }
 
+    /* Ein Hoerbuch, das warten musste. Ueber eine Kopie: abs_open()
+     * ueberschreibt g_abs_open selbst. */
+    if (g_want_abook >= 0 && !net_busy()) {
+        struct AbsBook b = g_abs_open;
+
+        g_want_abook = -1;
+        abs_open(&b, g_want_abook_play);
+    }
+    if (g_want_abooks && !net_busy()) {
+        abs_books_request();
+    }
+    abs_sync_step();
+
     /* Dasselbe fuer einen Ansichtswechsel, der auf das Netz warten
      * musste. */
     if (g_want_view >= 0 && !net_busy() && !g_list_job) {
@@ -3059,6 +3564,32 @@ static void job_done(struct NetJob *j)
         if (j->op == NJ_COVER && g_rcover_job) {
             g_rcover_job = FALSE;
             g_rfill++;
+            return;
+        }
+        /* Ein Buch ohne Cover: weiter zum naechsten, die Kachel bleibt
+         * leer. */
+        if (j->op == NJ_COVER && g_acover_job) {
+            g_acover_job = FALSE;
+            if (g_afill >= 0 && ++g_afill >= g_abalbums.count) {
+                g_afill = -1;
+            }
+            return;
+        }
+        if (j->op == NJ_ABS_BOOKS) {
+            g_abs_list_job = FALSE;
+            g_abs_seen = FALSE;     /* beim naechsten Besuch neu */
+        }
+        if (j->op == NJ_ABS_BOOK) {
+            g_abs_book_job = FALSE;
+        }
+        if (j->op == NJ_ABS_SYNC) {
+            /* Nicht sofort wiederholen - bei totem Netz ginge das jede
+             * Sekunde. Der naechste regulaere Abgleich kommt in 30 s. */
+            char msg[120];
+
+            g_abs_sync_job = FALSE;
+            sprintf(msg, "position not saved: %.90s", j->error);
+            say(msg);
             return;
         }
         if (j->op == NJ_COVER && g_thumb_job) {
@@ -3127,6 +3658,18 @@ static void job_done(struct NetJob *j)
         folder_fill(j);
         break;
 
+    case NJ_ABS_BOOKS:
+        abs_books_fill();
+        break;
+
+    case NJ_ABS_BOOK:
+        abs_book_fill(j);
+        break;
+
+    case NJ_ABS_SYNC:
+        g_abs_sync_job = FALSE;
+        break;
+
     case NJ_TRACKS:
         tracks_fill();
         break;
@@ -3161,6 +3704,20 @@ static void job_done(struct NetJob *j)
                     radio_cover_show();
                 }
                 g_rfill++;
+            }
+        } else if (g_acover_job) {
+            /* Ein Buchcover fuer die Bildwand. */
+            g_acover_job = FALSE;
+            athumb_load(g_afill, j->path);
+            if (g_afill >= 0 && ++g_afill >= g_abalbums.count) {
+                g_afill = -1;
+            }
+            /* Fehlte es dem laufenden Buch, gleich in die Leiste. */
+            if (g_now_ok && g_now.absitem[0] && !g_now_cover[0]
+                    && strcmp(j->id, g_now.coverart) == 0) {
+                strncpy(g_now_cover, j->path, sizeof(g_now_cover) - 1);
+                g_now_cover[sizeof(g_now_cover) - 1] = '\0';
+                set(player, MUIA_Pl_Cover, (ULONG)g_now_cover);
             }
         } else if (g_cslot_job) {
             /* Ein Cover fuer die Titelliste. */
@@ -3312,6 +3869,17 @@ static void tick(void)
         g_stream_bytes = net_stream_total();
     }
 
+    /* Hoerbuch: alle 30 s die Stelle an den Server. Nur waehrend es
+     * spielt - in der Pause aendert sie sich nicht, und die Pause hat
+     * sie schon gemeldet. */
+    if (audio_state() == AU_PLAYING && abs_now_pos() >= 0) {
+        if (++g_abs_ticks >= ABS_SYNC_SECS) {
+            g_abs_ticks = 0;
+            abs_note();
+        }
+    }
+    abs_sync_step();
+
     /* Wenn das Netz weg ist, soll das nicht stumm bleiben - aber die
      * Meldung muss auch wieder VERSCHWINDEN, sobald es weitergeht.
      * Sonst steht dort minutenlang "Netz weg", waehrend laengst wieder
@@ -3361,6 +3929,28 @@ static void now_goto(void)
         return;
     }
     if (!g_now_ok) {
+        return;
+    }
+
+    if (g_now.absitem[0]) {
+        /* Hoerbuch: ist es das geoeffnete, nur umschalten. Sonst
+         * oeffnen, aber NICHT neu starten - es laeuft ja schon. */
+        show_page(PAGE_PLAYER);
+        if (strcmp(g_abs_open.id, g_now.absitem) == 0 && g_songs.count > 0
+                && ((struct Song *)list_get(&g_songs, 0))->absitem[0]) {
+            mark_playing();
+            panel_show_now();
+            return;
+        }
+        {
+            struct AbsBook b;
+
+            memset(&b, 0, sizeof(b));
+            strcpy(b.id, g_now.absitem);
+            strncpy(b.title, g_now.album, sizeof(b.title) - 1);
+            strncpy(b.author, g_now.artist, sizeof(b.author) - 1);
+            abs_open(&b, FALSE);
+        }
         return;
     }
 
@@ -3443,6 +4033,9 @@ int main(void)
     list_init(&g_songs, sizeof(struct Song));
     list_init(&g_tracks, sizeof(struct Song));
     list_init(&g_favs, sizeof(struct Song));
+    list_init(&g_abooks, sizeof(struct AbsBook));
+    list_init(&g_abalbums, sizeof(struct Album));
+    list_init(&g_abs_tracks, sizeof(struct AbsTrack));
 
     MUIMasterBase = OpenLibrary(MUIMASTER_NAME, MUIMASTER_VMIN);
     if (!MUIMasterBase) {
@@ -3560,6 +4153,11 @@ int main(void)
         MUIA_TL_Title,  (ULONG)"Folder",
         TAG_DONE);
 
+    grid_abs = AlbumGridObject,
+        MUIA_AG_Colour, g_tint,
+        MUIA_AG_Title,  (ULONG)"Books",
+        TAG_DONE);
+
     lst_favs = TrackListObject,
         MUIA_TL_Kind,   TLK_TRACKS,
         MUIA_TL_Colour, g_tint,
@@ -3663,6 +4261,35 @@ int main(void)
                         TAG_DONE),
                     MUIA_Group_Child, btn_folder =
                         MUI_MakeObject(MUIO_Button, (ULONG)"Choose ..."),
+                    TAG_DONE),
+
+                /* Ein zweiter Server mit eigenem Zugang. Das Passwort
+                 * steht wie beim Navidrome im Klartext in den Prefs -
+                 * Audiobookshelf will es bei jeder Anmeldung. */
+                MUIA_Group_Child, MUI_NewObject(MUIC_Group,
+                    MUIA_Group_Columns, 2,
+                    MUIA_Frame,         MUIV_Frame_Group,
+                    MUIA_FrameTitle,    "Audiobookshelf",
+
+                    MUIA_Group_Child, MUI_MakeObject(MUIO_Label,
+                        (ULONG)"Server", 0),
+                    MUIA_Group_Child, str_absurl = MUI_NewObject(MUIC_String,
+                        MUIA_Frame,           MUIV_Frame_String,
+                        MUIA_String_MaxLen,   120,
+                        TAG_DONE),
+                    MUIA_Group_Child, MUI_MakeObject(MUIO_Label,
+                        (ULONG)"User", 0),
+                    MUIA_Group_Child, str_absuser = MUI_NewObject(MUIC_String,
+                        MUIA_Frame,           MUIV_Frame_String,
+                        MUIA_String_MaxLen,   60,
+                        TAG_DONE),
+                    MUIA_Group_Child, MUI_MakeObject(MUIO_Label,
+                        (ULONG)"Password", 0),
+                    MUIA_Group_Child, str_abspass = MUI_NewObject(MUIC_String,
+                        MUIA_Frame,           MUIV_Frame_String,
+                        MUIA_String_MaxLen,   120,
+                        MUIA_String_Secret,   TRUE,
+                        TAG_DONE),
                     TAG_DONE),
 
                 /* Welcher Modus hinter einer Unit liegt, stellt der
@@ -3801,6 +4428,9 @@ int main(void)
 
                         /* Seite 6: die eigenen Alben als Bildwand. */
                         MUIA_Group_Child, grid_folder,
+
+                        /* Seite 7: die Hoerbuecher als Bildwand. */
+                        MUIA_Group_Child, grid_abs,
                         TAG_DONE),
                     TAG_DONE),
 
@@ -3850,6 +4480,8 @@ int main(void)
              app, 2, MUIM_Application_ReturnID, ID_ALBUM_PICK);
     DoMethod(grid_folder, MUIM_Notify, MUIA_AG_Click, TRUE,
              app, 2, MUIM_Application_ReturnID, ID_FALBUM_PICK);
+    DoMethod(grid_abs, MUIM_Notify, MUIA_AG_Click, TRUE,
+             app, 2, MUIM_Application_ReturnID, ID_ABOOK_PICK);
     DoMethod(lst_queue, MUIM_Notify, MUIA_TL_DoubleClick, TRUE,
              app, 2, MUIM_Application_ReturnID, ID_SONG_PICK);
     DoMethod(lst_tracks, MUIM_Notify, MUIA_TL_DoubleClick, TRUE,
@@ -3962,6 +4594,10 @@ int main(void)
                 g_sb_home = which;
                 falbums_show();
                 break;
+            case SB_ABS_BOOKS:
+                g_sb_home = which;
+                abs_books_show();
+                break;
             case SB_SCAN:
                 /* Kein Seitenwechsel - die Markierung bleibt, wo sie
                  * war, wie bei Settings. */
@@ -3974,6 +4610,16 @@ int main(void)
                  * sie war. */
                 prefs_open();
                 break;
+            }
+            break;
+        }
+
+        case ID_ABOOK_PICK: {
+            LONG n = -1;
+
+            get(grid_abs, MUIA_AG_Active, &n);
+            if (n >= 0) {
+                abs_pick((int)n);
             }
             break;
         }
@@ -4123,6 +4769,7 @@ int main(void)
                         set(player, MUIA_Pl_Playing, FALSE);
                     }
                 } else if (audio_state() == AU_PLAYING) {
+                    abs_note();     /* Hoerbuch: Stelle der Pause */
                     audio_pause(TRUE);
                     set(player, MUIA_Pl_Playing, FALSE);
                 } else if (audio_state() == AU_PAUSED) {
@@ -4142,6 +4789,7 @@ int main(void)
                 break;
 
             case PLB_STOP:
+                abs_note();
                 audio_halt();
                 net_stream_end();
                 g_expect_play = FALSE;
@@ -4179,6 +4827,11 @@ int main(void)
                 get(player, MUIA_Pl_SeekTo, &secs);
                 if (!g_radio_on && g_qpos >= 0 && secs >= 0) {
                     stream_start(g_qpos, secs * 1000);
+                    /* Die NEUE Stelle melden - die alte hat
+                     * stream_start() schon vorgemerkt, sie wird damit
+                     * gleich ueberschrieben. */
+                    abs_note();
+                    g_abs_ticks = 0;
                 }
                 break;
             }
@@ -4213,7 +4866,7 @@ int main(void)
          * Signal anliegt - ohne zu warten. Liegt keines an, geht es
          * sofort mit dem naechsten Bild weiter. */
         if (track_covers_step() || radio_covers_step() || thumbs_step()
-                || lthumbs_step()) {
+                || lthumbs_step() || abs_thumbs_step()) {
             ULONG have = SetSignal(0, 0) & (g_tsig | net_signal());
 
             if (!have) {
@@ -4250,6 +4903,31 @@ int main(void)
     }
 
     set(win, MUIA_Window_Open, FALSE);
+
+    /* Hoerbuch: die letzte Stelle MUSS noch zum Server, sonst faengt das
+     * naechste Geraet dort an, wo der letzte 30-s-Abgleich war. Das ist
+     * der wichtigste Abgleich von allen - deshalb wird hier gewartet,
+     * aber begrenzt (je 10 s), damit sich das Programm bei totem Netz
+     * trotzdem beenden laesst. */
+    abs_note();
+    if (g_abs_due) {
+        int w;
+
+        for (w = 0; w < 500 && net_busy(); w++) {
+            if (net_poll()) {
+                break;
+            }
+            Delay(1);
+        }
+        g_abs_sync_job = FALSE;
+        abs_sync_step();
+        for (w = 0; w < 500 && net_busy(); w++) {
+            if (net_poll()) {
+                break;
+            }
+            Delay(1);
+        }
+    }
 
     /* Erst den Ton anhalten, dann den Netzprozess: der Abspieler liest
      * aus dem Ring, in den der Netzprozess schreibt. */
@@ -4291,6 +4969,9 @@ int main(void)
     list_free(&g_tracks);
     list_free(&g_favs);
     list_free(&g_radios);
+    list_free(&g_abooks);
+    list_free(&g_abalbums);
+    list_free(&g_abs_tracks);
     /* Kein sub_cleanup() hier - bsdsocket und AmiSSL gehoeren dem
      * Netzprozess und werden dort abgeraeumt. */
     return 0;

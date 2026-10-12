@@ -15,6 +15,8 @@
 #include "ring.h"
 #include "local.h"
 #include "amisub.h"
+#include "abs.h"
+#include "audio.h"
 
 /* Beide Prozesse sind derselbe Programmabzug und teilen sich damit auch
  * die globalen Daten - das ist der einfachste Weg, dem frisch
@@ -52,6 +54,61 @@ static long  g_st_waited = 0;       /* Ticks ohne Verbindung */
 static LONG  g_st_waited_s = 0;
 static UBYTE g_st_buf[ST_CHUNK];
 static char  g_st_msg[96];          /* was zuletzt geschah */
+
+/* Audiobookshelf: Datei des Buchs (g_st_id ist dann das Buch). */
+static char  g_st_ino[16];
+static long  g_st_skip = 0;         /* nach dem Etikett noch ueberspringen */
+
+/* Nach einem Sprung mitten in die Datei: erst den Rahmenanfang suchen.
+ * Vor dem ersten echten Rahmen stehen falsche Synchronwoerter, und
+ * mpega.library gibt am ersten davon auf ("no MPEG in stream",
+ * gemessen 12.10.2026). Nur beim ERSTEN Lesen nach dem Sprung - ein
+ * Wiederaufsetzen nach Netzabriss setzt nahtlos fort, dort ist der
+ * Dekoder laengst eingerastet. */
+static int   g_st_sync = 0;         /* > 0: so viele Scheiben noch suchen */
+
+/* Jede gescheiterte Verbindung des Stroms mit Uhrzeit und Grund nach T:
+ * - wie T:AmiSubsonic-cover.log. In der Statuszeile steht nur "network
+ * down", und daran laesst sich WLAN-Aussetzer und Programmfehler nicht
+ * unterscheiden (12.10.2026: zwei Fehlversuche beim ersten Hoerbuch,
+ * Grund unbekannt). */
+static void stream_fail_log(void)
+{
+    struct DateStamp ds;
+    BPTR fh;
+
+    fh = Open((STRPTR)"T:AmiSubsonic-stream.log", MODE_READWRITE);
+    if (!fh) {
+        return;
+    }
+    Seek(fh, 0, OFFSET_END);
+    DateStamp(&ds);
+    FPrintf(fh, "%02ld:%02ld:%02ld  %s\n",
+            ds.ds_Minute / 60, ds.ds_Minute % 60, ds.ds_Tick / 50,
+            (LONG)(ULONG)g_st_msg);
+    Close(fh);
+}
+
+/* Wie viel von buf vorn wegzulassen ist. Ist kein Rahmen sicher zu
+ * finden, wird die ganze Scheibe verworfen und in der naechsten weiter-
+ * gesucht - hoechstens vier Mal, dann geht es ungeprueft weiter. */
+static long sync_cut(const UBYTE *buf, long n)
+{
+    LONG k;
+
+    if (g_st_sync <= 0) {
+        return 0;
+    }
+    k = mp3_find_frame(buf, n);
+    if (k >= 0) {
+        g_st_sync = 0;
+        return k;
+    }
+    if (--g_st_sync > 0) {
+        return n;
+    }
+    return 0;
+}
 
 /* Zweite Quelle: eine Datei auf der Platte. Der Abspieler merkt davon
  * nichts - er liest aus demselben Ring. Nur gefuellt wird er hier
@@ -185,6 +242,10 @@ static void stream_begin(struct NetJob *j)
     Permit();
     g_st_ring = j->out_ring;
     g_st_off  = j->offset;          /* Byte, nicht Titelnummer */
+    strncpy(g_st_ino, j->ino, sizeof(g_st_ino) - 1);
+    g_st_ino[sizeof(g_st_ino) - 1] = '\0';
+    g_st_skip = j->skip;
+    g_st_sync = (j->offset > 0 || j->skip > 0) ? 4 : 0;
     g_st_on   = (g_st_ring != NULL);
     g_st_waited = 0;
     g_st_waited_s = 0;
@@ -464,7 +525,7 @@ static BOOL stream_slice(void)
         }
         n = Read(g_st_fh, g_st_buf, ST_CHUNK);
         if (n > 0) {
-            ULONG put = 0;
+            ULONG put = (ULONG)sync_cut(g_st_buf, n);
 
             while (put < (ULONG)n && !g_st_ring->stop) {
                 ULONG w = ring_write(g_st_ring, g_st_buf + put,
@@ -490,9 +551,15 @@ static BOOL stream_slice(void)
     }
 
     if (!g_st_open) {
-        if (sub_stream_open(g_prefs, g_st_id, g_st_off, &g_st) != SUB_OK) {
-            sprintf(g_st_msg, "oeffnen ab %ld fehlt: %.40s",
-                    g_st_off, sub_last_error());
+        int rc = g_st_ino[0]
+               ? abs_open_file(g_prefs, g_st_id, g_st_ino, g_st_off, &g_st)
+               : sub_stream_open(g_prefs, g_st_id, g_st_off, &g_st);
+
+        if (rc != SUB_OK) {
+            sprintf(g_st_msg, "oeffnen ab %ld fehlt: %.60s",
+                    g_st_off, g_st_ino[0] ? abs_last_error()
+                                          : sub_last_error());
+            stream_fail_log();
             /* In ZEIT rechnen, nicht in Anlaeufen: diese Funkstrecke
              * faellt ein bis drei Minuten aus (AGENTS.md 5.8). */
             if (g_st_waited >= ST_PATIENCE) {
@@ -507,9 +574,20 @@ static BOOL stream_slice(void)
         }
         g_st_open = TRUE;
         g_st_waited = 0;
+        /* Auch die angezeigte Zahl - sonst stand "network down -
+         * retrying for 4 s" weiter da, waehrend laengst Musik lief. */
+        g_st_waited_s = 0;
         sprintf(g_st_msg, "offen ab %ld von %ld", g_st_off, g_st.total);
         if (g_st_off == 0) {
             stream_skip_id3();
+            /* Einstieg mitten in die Datei: jetzt, wo die Laenge des
+             * Etiketts bekannt ist, an der Zielstelle neu verbinden. */
+            if (g_st_skip > 0) {
+                stream_close();
+                g_st_off += g_st_skip;
+                g_st_skip = 0;
+                return TRUE;
+            }
         }
     }
 
@@ -519,7 +597,7 @@ static BOOL stream_slice(void)
 
     n = sub_stream_read(&g_st, g_st_buf, ST_CHUNK);
     if (n > 0) {
-        ULONG put = 0;
+        ULONG put = (ULONG)sync_cut(g_st_buf, n);
 
         while (put < (ULONG)n && !g_st_ring->stop) {
             ULONG w = ring_write(g_st_ring, g_st_buf + put, (ULONG)n - put);
@@ -934,9 +1012,50 @@ static void do_job(struct NetJob *j)
          * schreibt den Zielpfad nach j->path zurueck, laesst eine schon
          * vorhandene Datei in Ruhe und raeumt eine abgebrochene weg.
          * Damit gibt es im ganzen Programm genau EINEN Ort, der
-         * entscheidet, wo ein Cover liegt. */
+         * entscheidet, wo ein Cover liegt.
+         *
+         * "ab-..." ist ein Hoerbuch - dasselbe, nur vom anderen Server. */
+        if (strncmp(j->id, "ab-", 3) == 0) {
+            j->rc = abs_cover_cached(g_prefs, j->id, j->size,
+                                     j->path, (int)sizeof(j->path));
+            if (j->rc != SUB_OK) {
+                strncpy(j->error, abs_last_error(), sizeof(j->error) - 1);
+                return;
+            }
+            break;
+        }
         j->rc = sub_get_cover_cached(g_prefs, j->id, j->size,
                                      j->path, (int)sizeof(j->path));
+        break;
+
+    case NJ_ABS_BOOKS:
+        j->rc = abs_books(g_prefs, j->out_list);
+        if (j->rc != SUB_OK) {
+            strncpy(j->error, abs_last_error(), sizeof(j->error) - 1);
+            return;
+        }
+        break;
+
+    case NJ_ABS_BOOK: {
+        BOOL fin = FALSE;
+
+        j->rc = abs_tracks(g_prefs, j->id, j->out_list, &j->dur_ms);
+        if (j->rc == SUB_OK) {
+            j->rc = abs_get_pos(g_prefs, j->id, &j->pos_ms, &fin);
+        }
+        if (j->rc != SUB_OK) {
+            strncpy(j->error, abs_last_error(), sizeof(j->error) - 1);
+            return;
+        }
+        break;
+    }
+
+    case NJ_ABS_SYNC:
+        j->rc = abs_set_pos(g_prefs, j->id, j->pos_ms, j->dur_ms);
+        if (j->rc != SUB_OK) {
+            strncpy(j->error, abs_last_error(), sizeof(j->error) - 1);
+            return;
+        }
         break;
 
     case NJ_LYRICS:

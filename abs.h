@@ -86,4 +86,13 @@ int  abs_find_track(struct SubList *tracks, long pos_ms, long *in_ms);
  * Aufrufer dazu. */
 long abs_byte_for_ms(const struct AbsTrack *t, long in_ms);
 
+/* Kennung eines Buchcovers im Cache: "ab-<itemid>". out braucht
+ * SUB_ID_LEN Bytes. */
+void abs_cover_id(const char *itemid, char *out);
+
+/* Wie sub_get_cover_cached: liegt das Cover schon im Cache, nur den
+ * Pfad liefern, sonst als JPEG holen. coverid ist "ab-<itemid>". */
+int  abs_cover_cached(struct Prefs *p, const char *coverid, int size,
+                      char *out, int outsize);
+
 #endif

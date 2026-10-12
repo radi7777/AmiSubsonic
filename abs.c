@@ -4,6 +4,7 @@
  * (Audiobookshelf 2.35.1, 12.10.2026), nicht aus der Doku geraten. */
 
 #include <exec/types.h>
+#include <proto/dos.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -615,4 +616,67 @@ long abs_byte_for_ms(const struct AbsTrack *t, long in_ms)
     /* kbit/s * ms / 8 = Bytes. in_ms * kbps passt bis 4,6e8 (eine
      * Stunde bei 128 kbps) locker in 32 Bit. */
     return in_ms * kbps / 8;
+}
+
+/* ------------------------------------------------------------------ */
+/* Cover                                                               */
+/* ------------------------------------------------------------------ */
+
+void abs_cover_id(const char *itemid, char *out)
+{
+    /* "ab-" und nicht "abs-": mit der 36 Zeichen langen UUID passen
+     * genau 39 Zeichen plus Nullbyte in SUB_ID_LEN. */
+    sprintf(out, "ab-%.36s", itemid);
+}
+
+int abs_cover_cached(struct Prefs *p, const char *coverid, int size,
+                     char *out, int outsize)
+{
+    char path[120];
+    char *resp = NULL;
+    long len = 0;
+    BPTR fh;
+    int rc;
+
+    if (strncmp(coverid, "ab-", 3) != 0) {
+        return abs_fail(SUB_EAPI, "not an Audiobookshelf cover");
+    }
+    cache_path(p, coverid, out, outsize);
+    if (out[0] == '\0') {
+        return abs_fail(SUB_EMEM, "cache path too long");
+    }
+    if (cache_have(p, coverid)) {
+        return SUB_OK;
+    }
+    rc = cache_ensure(p);
+    if (rc != SUB_OK) {
+        return rc;
+    }
+
+    /* format=jpeg: von sich aus liefert Audiobookshelf WebP (gemessen),
+     * und dafuer hat kaum ein Amiga einen Datatype. */
+    sprintf(path, "/api/items/%.40s/cover?width=%d&format=jpeg",
+            coverid + 3, size > 0 ? size : 300);
+    rc = abs_call(p, "GET", path, NULL, &resp, &len);
+    if (rc != SUB_OK) {
+        out[0] = '\0';
+        return rc;
+    }
+    fh = Open((STRPTR)out, MODE_NEWFILE);
+    if (!fh) {
+        free(resp);
+        out[0] = '\0';
+        return abs_fail(SUB_EMEM, "cannot write cover into cache");
+    }
+    if (Write(fh, resp, len) != len) {
+        /* Halbe Datei weg - sie laege sonst fuer immer im Cache. */
+        Close(fh);
+        DeleteFile((STRPTR)out);
+        free(resp);
+        out[0] = '\0';
+        return abs_fail(SUB_EMEM, "cover write failed");
+    }
+    Close(fh);
+    free(resp);
+    return SUB_OK;
 }

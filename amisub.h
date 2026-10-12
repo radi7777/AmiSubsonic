@@ -114,6 +114,10 @@ struct Album {
      * gehoert. Beim Server bleibt beides leer bzw. 0. */
     char dir[192];
     int  first, count;
+
+    /* Freie dritte Zeile der Bildwand, wenn kein Jahr da ist - bei
+     * Hoerbuechern der Fortschritt ("36%"). */
+    char note[16];
 };
 
 struct Song {
@@ -140,6 +144,13 @@ struct Song {
      * wenn die Liste danach anders sortiert wird - ueber einen Bereich
      * "ab Zeile x, y Stueck" ginge das nicht. */
     int  lalbum;
+
+    /* Nur bei Hoerbuechern (Audiobookshelf): das Buch, zu dem die Datei
+     * gehoert, und wo sie darin anfaengt. id ist dann die Dateinummer
+     * (ino). Damit laesst sich aus der Stelle in der Datei die Stelle im
+     * BUCH ausrechnen - die geht an den Server zurueck. */
+    char absitem[SUB_ID_LEN];
+    long abs_start_ms;
 };
 
 /* Eine Radiostation, wie getInternetRadioStations sie liefert. Sie ist

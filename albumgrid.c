@@ -549,6 +549,11 @@ static ULONG ag_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
             year[0] = '\0';
             if (a->year > 0) {
                 sprintf(year, "%d", a->year);
+            } else if (a->note[0]) {
+                /* Ohne Jahr eine freie Angabe - beim Hoerbuch der
+                 * Fortschritt. */
+                strncpy(year, a->note, sizeof(year) - 1);
+                year[sizeof(year) - 1] = '\0';
             }
             if (line_fits(obj, y + AG_COVER + 2 + 2 * lh, t, t + h)) {
                 draw_line(obj, year, x, y + AG_COVER + 2 + 2 * lh,
