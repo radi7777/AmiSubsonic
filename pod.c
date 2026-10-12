@@ -216,6 +216,7 @@ struct RssCtx {
     struct PodEpisode eps[POD_EPISODES];
     int   n;
     long  total;
+    long  videos;               /* uebersprungene Video-Folgen */
     int   order;
     ULONG first_when;
     BOOL  stop;
@@ -441,6 +442,19 @@ static void item_done(struct RssCtx *c)
 
     if (!e->url[0]) {
         return;                 /* keine Audiodatei - kein Podcast */
+    }
+    /* Video spielt der Amiga nicht. Bei Apple stehen manche Sendungen
+     * mehrfach, als Audio UND als Video (c't uplink, 12.10.2026) - wer
+     * die Video-Fassung erwischt, soll es beim Abonnieren erfahren und
+     * nicht erst beim Abspielen. */
+    if (strncmp(e->type, "video/", 6) == 0) {
+        c->videos++;
+        /* 20 Videos und noch kein Ton: das ist ein Video-Feed. Nicht
+         * noch Megabytes weiterlesen, um das zu bestaetigen. */
+        if (c->videos >= 20 && c->n == 0) {
+            c->stop = TRUE;
+        }
+        return;
     }
     if (!e->key[0]) {
         pod_key(e->url, e->key);
@@ -947,9 +961,13 @@ int pod_refresh(struct PodFeed *f, BOOL *changed)
     sub_stream_close(&st);
 
     if (c->n == 0) {
+        BOOL video = (c->videos > 0);
+
         FreeVec(c);
         FreeVec(buf);
-        return pod_fail(SUB_EAPI, "feed has no audio episodes");
+        return pod_fail(SUB_EAPI, video
+                        ? "video podcast - choose the audio version"
+                        : "feed has no audio episodes");
     }
 
     /* Neueste zuerst. */

@@ -3796,6 +3796,21 @@ static void pod_play_index(int idx)
     if (idx < 0 || idx >= g_pod_view.count) {
         return;
     }
+    /* Nur MP3 kann der Abspieler aus einer Datei. Andere Formate (AAC in
+     * M4A, Video) gar nicht erst anfangen - sonst stuende nur "cannot
+     * read stream" da, ohne Grund. Ohne Typangabe wird es versucht. */
+    {
+        const char *t = g_pod_view.ep[idx].type;
+
+        if (t[0] && strnicmp(t, "audio/mpeg", 10) != 0
+                && strnicmp(t, "audio/mp3", 9) != 0) {
+            char msg[80];
+
+            sprintf(msg, "episode is %.30s - only MP3 can be played", t);
+            say(msg);
+            return;
+        }
+    }
     abs_note();                     /* was bis eben lief, sichern */
     g_pod_play = g_pod_view;
     e = &g_pod_play.ep[idx];
