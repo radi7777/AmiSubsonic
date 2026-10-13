@@ -6,8 +6,7 @@
 #include <proto/intuition.h>
 #include <proto/utility.h>
 #include <proto/muimaster.h>
-#include <proto/cybergraphics.h>
-#include <cybergraphx/cybergraphics.h>
+#include "pix.h"
 #include <intuition/intuition.h>
 #include <libraries/mui.h>
 #include <clib/alib_protos.h>
@@ -103,6 +102,8 @@ struct AGData {
 
     ULONG *buf;                 /* vorgerechneter Verlauf */
     LONG   buf_w, buf_h;
+
+    LONG   upd;                 /* nur diese Kachel nachzeichnen, -1 = keine */
     ULONG  buf_col;
 
     /* Ueberschrift. Kopiert, weil der Auftraggeber sie aus einem
@@ -254,9 +255,15 @@ static void draw_gradient(Object *obj, struct AGData *d)
     LONG l = _mleft(obj), t = _mtop(obj);
     LONG w = _mwidth(obj), h = _mheight(obj);
 
-    if (w <= 0 || h <= 0 || !CyberGfxBase) {
+    if (w <= 0 || h <= 0 || !PIXOK) {
         return;
     }
+#ifdef AMI_ECS
+    /* Die Bildwand ist auf ECS schwarz und die Cover grau (Wunsch des
+     * Anwenders, 13.10.2026) - die Albumfarbe kommt erst mit dem Album. */
+    ecs_fill_pen(rp, l, t, w, h, EPEN_BLACK);
+    return;
+#endif
 
     if (build_gradient(d, w, h)) {
         WritePixelArray(d->buf, 0, 0, (UWORD)(w * 4), rp,
@@ -323,7 +330,7 @@ static void draw_thumb(Object *obj, struct AlbumThumb *th, LONG x, LONG y,
     struct RastPort *rp = _rp(obj);
     LONG ox, oy, sy, hh;
 
-    if (!CyberGfxBase) {
+    if (!PIXOK) {
         return;
     }
 
@@ -337,7 +344,8 @@ static void draw_thumb(Object *obj, struct AlbumThumb *th, LONG x, LONG y,
         if (oy + hh > bot)  { hh = bot - oy; }
         if (hh > 0) {
             FillPixelArray(rp, (UWORD)x, (UWORD)oy,
-                           (UWORD)AG_COVER, (UWORD)hh, 0x00201828);
+                           (UWORD)AG_COVER, (UWORD)hh,
+                           PIXRGB(0x00201828, 0x00444444));
         }
         return;
     }
@@ -360,9 +368,9 @@ static void draw_thumb(Object *obj, struct AlbumThumb *th, LONG x, LONG y,
         return;
     }
 
-    WritePixelArray((APTR)th->rgb, 0, (UWORD)sy, (UWORD)(th->w * 3), rp,
+    WritePixelArrayMode((APTR)th->rgb, 0, (UWORD)sy, (UWORD)(th->w * PIXBPP), rp,
                     (UWORD)ox, (UWORD)oy,
-                    (UWORD)th->w, (UWORD)hh, RECTFMT_RGB);
+                    (UWORD)th->w, (UWORD)hh, RECTFMT_RGB, PIX_GRAY);
 }
 
 /* Text nur zeichnen, wenn die Zeile GANZ ins Objekt passt. Eine
@@ -410,7 +418,7 @@ static void draw_scrollbar(Object *obj, struct AGData *d)
     LONG t = grid_top(obj, d), h = grid_height(obj, d);
     LONG ty, th;
 
-    if (!CyberGfxBase || h <= 0) {
+    if (!PIXOK || h <= 0) {
         return;
     }
 
@@ -433,8 +441,41 @@ static void draw_scrollbar(Object *obj, struct AGData *d)
 
         FillPixelArray(rp, (UWORD)(x + 2), (UWORD)ty,
                        AG_SBW - 4, (UWORD)th,
-                       ((ULONG)r0 << 16) | ((ULONG)g0 << 8) | (ULONG)b0);
+                       PIXRGB(((ULONG)r0 << 16) | ((ULONG)g0 << 8)
+                              | (ULONG)b0, 0x00444444));
     }
+}
+
+/* Nur das Bildfeld EINER Kachel neu: erst den Untergrund (Verlauf bzw.
+ * die feste Farbe), dann das Cover. Text und Rahmen stehen schon. */
+static void draw_one(Object *obj, struct AGData *d, LONG idx)
+{
+    struct RastPort *rp = _rp(obj);
+    LONG t = grid_top(obj, d), h = grid_height(obj, d);
+    LONG cw = cell_width(), ch = cell_height(obj), cols = columns(obj);
+    LONG x, y, y0, y1;
+
+    if (idx < 0 || idx >= count_albums(d) || cols <= 0 || !PIXOK) {
+        return;
+    }
+    x = _mleft(obj) + (idx % cols) * cw + AG_GAP_X / 2;
+    y = t + (idx / cols) * ch - d->off;
+    y0 = (y < t) ? t : y;
+    y1 = (y + AG_COVER > t + h) ? t + h : y + AG_COVER;
+    if (y1 <= y0) {
+        return;                         /* nicht zu sehen */
+    }
+#ifdef AMI_ECS
+    ecs_fill_pen(rp, x, y0, AG_COVER, y1 - y0, EPEN_BLACK);
+#else
+    if (d->buf && d->buf_w == _mwidth(obj) && d->buf_h == _mheight(obj)) {
+        WritePixelArray(d->buf, (UWORD)(x - _mleft(obj)),
+                        (UWORD)(y0 - _mtop(obj)), (UWORD)(d->buf_w * 4), rp,
+                        (UWORD)x, (UWORD)y0, (UWORD)AG_COVER,
+                        (UWORD)(y1 - y0), RECTFMT_ARGB);
+    }
+#endif
+    draw_thumb(obj, d->thumbs ? &d->thumbs[idx] : NULL, x, y, t, t + h);
 }
 
 static ULONG ag_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
@@ -446,6 +487,11 @@ static ULONG ag_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
 
     DoSuperMethodA(cl, obj, (Msg)msg);
 
+    if ((msg->flags & MADF_DRAWUPDATE) && d->upd >= 0) {
+        draw_one(obj, d, d->upd);
+        d->upd = -1;
+        return 0;
+    }
     if (!(msg->flags & MADF_DRAWOBJECT)) {
         return 0;
     }
@@ -511,7 +557,7 @@ static ULONG ag_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
             /* Das gewaehlte Album bekommt einen aufgehellten Kasten -
              * dieselbe Loesung wie in der Titelliste, damit die
              * Markierung zu jedem Farbton passt. */
-            if (idx == d->active && CyberGfxBase) {
+            if (idx == d->active && PIXOK) {
                 LONG r0 = ((d->colour >> 16) & 0xff) + 60;
                 LONG g0 = ((d->colour >>  8) & 0xff) + 60;
                 LONG b0 = ( d->colour        & 0xff) + 60;
@@ -527,20 +573,21 @@ static ULONG ag_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
                 if (bh > 0) {
                     FillPixelArray(rp, (UWORD)(x - AG_GAP_X / 2), (UWORD)by,
                                    (UWORD)cw, (UWORD)bh,
-                                   ((ULONG)r0 << 16) | ((ULONG)g0 << 8)
-                                 | (ULONG)b0);
+                                   PIXRGB(((ULONG)r0 << 16)
+                                          | ((ULONG)g0 << 8) | (ULONG)b0,
+                                          0x00444444));
                 }
             }
 
             draw_thumb(obj, d->thumbs ? &d->thumbs[idx] : NULL, x, y,
                        t, t + h);
 
-            pen = _pens(obj)[MPEN_SHINE];
+            pen = MPEN(obj, MPEN_SHINE);
             if (line_fits(obj, y + AG_COVER + 2, t, t + h)) {
                 draw_line(obj, a->name, x, y + AG_COVER + 2, AG_COVER, pen);
             }
 
-            pen = _pens(obj)[MPEN_HALFSHINE];
+            pen = MPEN(obj, MPEN_HALFSHINE);
             if (line_fits(obj, y + AG_COVER + 2 + lh, t, t + h)) {
                 draw_line(obj, a->artist, x, y + AG_COVER + 2 + lh,
                           AG_COVER, pen);
@@ -770,6 +817,7 @@ static ULONG ag_new(struct IClass *cl, Object *obj, struct opSet *msg)
         d->title[sizeof(d->title) - 1] = '\0';
     }
     d->active = -1;
+    d->upd = -1;
     d->off    = 0;
     return (ULONG)obj;
 }
@@ -954,6 +1002,23 @@ static ULONG ag_refresh(struct IClass *cl, Object *obj, Msg msg)
     return 0;
 }
 
+static ULONG ag_refresh_cell(struct IClass *cl, Object *obj,
+                             struct MUIP_AG_RefreshCell *msg)
+{
+    struct AGData *d = INST_DATA(cl, obj);
+
+    /* Die gewaehlte Kachel hat einen eigenen Untergrund - dort lieber
+     * alles, das kommt selten vor. */
+    if (msg->idx == d->active) {
+        MUI_Redraw(obj, MADF_DRAWOBJECT);
+        return 0;
+    }
+    d->upd = msg->idx;
+    MUI_Redraw(obj, MADF_DRAWUPDATE);
+    d->upd = -1;
+    return 0;
+}
+
 static ULONG ag_dispatch(struct IClass *cl  __asm("a0"),
                          Object       *obj __asm("a2"),
                          Msg           msg __asm("a1"))
@@ -976,6 +1041,8 @@ static ULONG ag_dispatch(struct IClass *cl  __asm("a0"),
     case MUIM_AG_SetList:   return ag_setlist(cl, obj,
                                     (struct MUIP_AG_SetList *)msg);
     case MUIM_AG_Refresh:   return ag_refresh(cl, obj, msg);
+    case MUIM_AG_RefreshCell:
+        return ag_refresh_cell(cl, obj, (struct MUIP_AG_RefreshCell *)msg);
     }
     return DoSuperMethodA(cl, obj, msg);
 }

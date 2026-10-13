@@ -88,4 +88,8 @@ BOOL audio_play_file(const char *path, LONG unit, struct AudioProbe *out);
  * Ring leer UND als beendet markiert ist, oder bei Strg-C. */
 BOOL audio_play_ring(struct Ring *r, LONG unit, struct AudioProbe *out);
 
+/* Nur ECS: Tonqualitaet 0 Low, 1 Medium, 2 High - gilt ab dem naechsten
+ * Titel. */
+void audio_set_quality(LONG q);
+
 #endif

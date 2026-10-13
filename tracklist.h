@@ -51,9 +51,7 @@
  * Verlauf laeuft dann ohne Naht durch. Leer heisst: kein Streifen. */
 #define MUIA_TL_Title       (TAG_USER | 0x41544c06)  /* STRPTR */
 
-/* Kantenlaenge der kleinen Cover in TLK_TRACKS. Oeffentlich, weil der
- * Auftraggeber die Miniaturen genau auf dieses Mass herunterrechnet. */
-#define TL_THUMB_SIZE 24
+/* TL_THUMB_SIZE (die kleinen Cover in TLK_TRACKS) steht in cover.h. */
 
 /* Die Liste zeigt auf fremde Daten und kopiert sie NICHT. Der Aufrufer
  * muss sie am Leben halten, solange sie gesetzt sind - und die Liste

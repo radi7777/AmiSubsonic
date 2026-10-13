@@ -60,6 +60,48 @@ const char *audio_last_error(void)
     return g_why[0] ? g_why : "no error";
 }
 
+/* Wie mpega dekodiert.
+ *
+ * Auf RTG volle Qualitaet: keine Halbierung der Rate, kein Zwangsmono.
+ *
+ * Auf ECS (68030, Paula) reicht die Maschine dafuer nicht: gemessen auf
+ * der TF536 (13.10.2026, 30 s Musik) kostet 44,1 kHz stereo 344 bis
+ * 377 % der Maschine. Mono, einfache Qualitaet und hoechstens 12 kHz
+ * kosten beim Original 60 bis 70 %, bei einer vom Server auf 22 kHz
+ * mono umgerechneten Fassung 38 %. freq_div 0 heisst: mpega waehlt den
+ * Teiler selbst, sodass freq_max nicht ueberschritten wird - 44,1 kHz
+ * wird durch 4 geteilt, 22 kHz durch 2. */
+static LONG g_quality = 1;
+
+void audio_set_quality(LONG q)
+{
+    g_quality = q;
+}
+
+static void set_quality(MPEGA_CTRL *c)
+{
+#ifdef AMI_ECS
+    /* Die Stufen der Einstellung "Audio quality" (gemessen auf der
+     * TF536, 13.10.2026, siehe amisub.h). High laesst bis 16 kHz zu -
+     * eine 16-kHz-Quelle (mp3a16) wird dann ungeteilt gespielt, ein
+     * 44,1-kHz-Podcast weiter durch 4. */
+    c->layer_1_2.force_mono = 1;
+    c->layer_1_2.mono.freq_div = 0;
+    c->layer_1_2.mono.freq_max = (g_quality >= 2) ? 16000 : 12000;
+    c->layer_1_2.mono.quality = (g_quality == 0) ? MPEGA_QUALITY_LOW
+                              : (g_quality == 1) ? MPEGA_QUALITY_HIGH
+                              :                    MPEGA_QUALITY_MEDIUM;
+    c->layer_1_2.stereo = c->layer_1_2.mono;
+#else
+    c->layer_1_2.force_mono = 0;
+    c->layer_1_2.mono.freq_div = 1;
+    c->layer_1_2.mono.quality = MPEGA_QUALITY_HIGH;
+    c->layer_1_2.stereo.freq_div = 1;
+    c->layer_1_2.stereo.quality = MPEGA_QUALITY_HIGH;
+#endif
+    c->layer_3 = c->layer_1_2;
+}
+
 /* Zeit in Hundertstelsekunden. DateStamp zaehlt in Ticks zu 1/50 s, das
  * reicht hier: gemessen werden Sekunden bis Minuten. */
 static ULONG now_cs(void)
@@ -97,12 +139,7 @@ BOOL audio_probe_file(const char *path, struct AudioProbe *out)
     /* Volle Qualitaet: keine Halbierung der Rate, kein Zwangsmono. Das
      * Programm ist fuer schnelle Maschinen gedacht, und genau das soll
      * die Messung ja zeigen. */
-    ctrl.layer_1_2.force_mono = 0;
-    ctrl.layer_1_2.mono.freq_div = 1;
-    ctrl.layer_1_2.mono.quality = MPEGA_QUALITY_HIGH;
-    ctrl.layer_1_2.stereo.freq_div = 1;
-    ctrl.layer_1_2.stereo.quality = MPEGA_QUALITY_HIGH;
-    ctrl.layer_3 = ctrl.layer_1_2;
+    set_quality(&ctrl);
 
     mps = MPEGA_open((char *)path, &ctrl);
     if (!mps) {
@@ -419,11 +456,7 @@ BOOL audio_play_file(const char *path, LONG unit, struct AudioProbe *out)
 
     memset(&ctrl, 0, sizeof(ctrl));
     ctrl.check_mpeg = 1;
-    ctrl.layer_1_2.mono.freq_div = 1;
-    ctrl.layer_1_2.mono.quality = MPEGA_QUALITY_HIGH;
-    ctrl.layer_1_2.stereo.freq_div = 1;
-    ctrl.layer_1_2.stereo.quality = MPEGA_QUALITY_HIGH;
-    ctrl.layer_3 = ctrl.layer_1_2;
+    set_quality(&ctrl);
 
     mps = MPEGA_open((char *)path, &ctrl);
     if (!mps) {
@@ -688,11 +721,7 @@ BOOL audio_play_ring(struct Ring *r, LONG unit, struct AudioProbe *out)
     memset(&ctrl, 0, sizeof(ctrl));
     ctrl.bs_access = &hook;             /* HIER kommt der Ring ins Spiel */
     ctrl.check_mpeg = 1;
-    ctrl.layer_1_2.mono.freq_div = 1;
-    ctrl.layer_1_2.mono.quality = MPEGA_QUALITY_HIGH;
-    ctrl.layer_1_2.stereo.freq_div = 1;
-    ctrl.layer_1_2.stereo.quality = MPEGA_QUALITY_HIGH;
-    ctrl.layer_3 = ctrl.layer_1_2;
+    set_quality(&ctrl);
 
     /* Der Dateiname wird mit dem eigenen Hook nicht benutzt, mpega
      * reicht ihn nur an MPEGA_BSFUNC_OPEN durch. */
@@ -1197,11 +1226,7 @@ static void ap_play_track(void)
     memset(&ctrl, 0, sizeof(ctrl));
     ctrl.bs_access = &hook;
     ctrl.check_mpeg = 1;
-    ctrl.layer_1_2.mono.freq_div = 1;
-    ctrl.layer_1_2.mono.quality = MPEGA_QUALITY_HIGH;
-    ctrl.layer_1_2.stereo.freq_div = 1;
-    ctrl.layer_1_2.stereo.quality = MPEGA_QUALITY_HIGH;
-    ctrl.layer_3 = ctrl.layer_1_2;
+    set_quality(&ctrl);
 
     mps = MPEGA_open("<strom>", &ctrl);
     if (!mps) {

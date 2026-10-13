@@ -81,6 +81,30 @@ AmiSubsonic: $(GUI_OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Die ECS-Fassung (A500 mit 68030, 8 Farben, 11 kHz) - derselbe
+# Quelltext, uebersetzt mit -DAMI_ECS in ein eigenes Verzeichnis, damit
+# sich die Objekte beider Fassungen nicht ueberschreiben.
+#   make ecs  → AmiSubsonicECS
+ECS_DIR  = build/ecs
+ECS_SRCS = amisub.c md5.c cover.c audio.c ring.c local.c json.c abs.c \
+           pod.c gui.c panel.c tracklist.c albumgrid.c sidebar.c tabs.c \
+           visual.c player.c netjob.c muistubs.c ecsgfx.c
+ECS_OBJS = $(patsubst %.c,$(ECS_DIR)/%.o,$(ECS_SRCS)) aacsize.o aacsize_sbr.o \
+           $(AAC_OBJS) build/DoMethod.o build/DoSuperMethod.o
+
+ecs: AmiSubsonicECS
+
+AmiSubsonicECS: $(ECS_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(ECS_OBJS) $(LDFLAGS)
+
+$(ECS_DIR)/%.o: %.c
+	@mkdir -p $(ECS_DIR)
+	$(CC) $(CFLAGS) -DAMI_ECS -c -o $@ $<
+
+$(ECS_DIR)/visual.o: visual.c
+	@mkdir -p $(ECS_DIR)
+	$(CC) $(filter-out -Os,$(CFLAGS)) -O3 -fwrapv -DAMI_ECS -c -o $@ $<
+
 # Der Visualizer rechnet je Bild eine FFT und zeichnet einige tausend
 # Bildpunkte - als einziger Teil dieses Programms lohnt sich hier
 # Tempo vor Groesse. Gemessen auf der PiStorm (22.9.2026, 300 Bilder):
@@ -115,13 +139,15 @@ build/DoSuperMethod.o: $(AMIGALIB)
 # ausgefuehrt wird.
 check-fpu: AmiSubsonicCLI AmiSubsonic
 	@python3 checkfpu.py $(OBJDUMP) AmiSubsonicCLI AmiSubsonic
+	@if [ -f AmiSubsonicECS ]; then python3 checkfpu.py $(OBJDUMP) AmiSubsonicECS; fi
 
 push: AmiSubsonicCLI AmiSubsonic AmiSubsonic.info
 	python3 push.py AmiSubsonicCLI AmiSubsonic AmiSubsonic.info
 
--include $(CORE_OBJS:.o=.d) cli.d $(GUI_OBJS:.o=.d) $(AAC_OBJS:.o=.d)
+-include $(CORE_OBJS:.o=.d) cli.d $(GUI_OBJS:.o=.d) $(AAC_OBJS:.o=.d) \
+         $(ECS_OBJS:.o=.d)
 
 clean:
-	rm -rf *.o *.d build AmiSubsonicCLI AmiSubsonic
+	rm -rf *.o *.d build AmiSubsonicCLI AmiSubsonic AmiSubsonicECS
 
-.PHONY: all clean check-fpu push
+.PHONY: all ecs clean check-fpu push

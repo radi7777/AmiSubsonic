@@ -6,8 +6,7 @@
 #include <proto/intuition.h>
 #include <proto/utility.h>
 #include <proto/muimaster.h>
-#include <proto/cybergraphics.h>
-#include <cybergraphx/cybergraphics.h>
+#include "pix.h"
 #include <intuition/intuition.h>
 #include <libraries/mui.h>
 #include <clib/alib_protos.h>
@@ -49,6 +48,16 @@ struct TLData {
 
     struct SubList *list;       /* fremde Daten, nicht kopiert */
     char           *text;       /* dito, fuer TLK_TEXT */
+
+    /* TLK_TEXT, umgebrochen auf die Breite der Flaeche. Auf 640 Punkten
+     * waren die Zeilen des Liedtextes rechts abgeschnitten, und weil der
+     * Text dadurch nie laenger als die Flaeche wurde, kam auch keine
+     * Rollleiste (Anwender, 13.10.2026). Der Puffer kommt aus AllocVec -
+     * exec ist anders als libnix' malloc gegen den Netzprozess sicher.
+     * Umgebrochen wird beim Zeichnen, sobald sich die Breite aendert. */
+    char           *wtext;
+    LONG            wsize;
+    LONG            wrap_w;     /* Breite, fuer die wtext gilt, -1 = neu */
 
     LONG   active;              /* gewaehlte Zeile, -1 = keine */
     LONG   playing;             /* laufender Titel, -1 = keiner */
@@ -92,7 +101,8 @@ static LONG count_rows(struct TLData *d)
 {
     if (d->kind == TLK_TEXT) {
         LONG n = 0;
-        const char *p = d->text;
+        const char *t0 = (d->wtext && d->wrap_w >= 0) ? d->wtext : d->text;
+        const char *p = t0;
 
         if (!p || !*p) {
             return 0;
@@ -103,7 +113,7 @@ static LONG count_rows(struct TLData *d)
             }
         }
         /* Eine letzte Zeile ohne abschliessenden Umbruch zaehlt mit. */
-        if (p > d->text && p[-1] != '\n') {
+        if (p > t0 && p[-1] != '\n') {
             n++;
         }
         return n;
@@ -158,7 +168,7 @@ static void row_text(struct TLData *d, LONG i,
             sprintf(right, "%d", a->year);
         }
     } else {
-        const char *p = d->text;
+        const char *p = (d->wtext && d->wrap_w >= 0) ? d->wtext : d->text;
         LONG n = 0;
         const char *end;
 
@@ -233,9 +243,14 @@ static void draw_gradient(Object *obj, struct TLData *d)
     LONG l = _mleft(obj), t = _mtop(obj);
     LONG w = _mwidth(obj), h = _mheight(obj);
 
-    if (w <= 0 || h <= 0 || !CyberGfxBase) {
+    if (w <= 0 || h <= 0 || !PIXOK) {
         return;
     }
+#ifdef AMI_ECS
+    /* Kein Verlauf auf ECS: eine feste Farbe aus dem Album (Stift 4). */
+    ecs_fill_pen(rp, l, t, w, h, EPEN_ALB);
+    return;
+#endif
 
     if (build_gradient(d, w, h)) {
         WritePixelArray(d->buf, 0, 0, (UWORD)(w * 4), rp,
@@ -349,10 +364,20 @@ static void draw_scrollbar(Object *obj, struct TLData *d)
     LONG t = list_top(obj, d), h = list_height(obj, d);
     LONG ty, th;
 
-    if (!CyberGfxBase || h <= 0) {
+    if (!PIXOK || h <= 0) {
         return;
     }
 
+#ifdef AMI_ECS
+    /* Bahn im dunklen, Griff im hellen Albumton. Eine schwarze Bahn
+     * stach aus der einfarbigen Flaeche heraus; ein Griff im dunklen Ton
+     * war beim Liedtext kaum zu sehen (Anwender, 13.10.2026). */
+    ecs_fill_pen(rp, x, t, TL_SBW, h, EPEN_ALBDK);
+    if (thumb_rect(obj, d, &ty, &th)) {
+        ecs_fill_pen(rp, x + 2, ty, TL_SBW - 4, th, EPEN_ALBLT);
+    }
+    return;
+#endif
     FillPixelArray(rp, (UWORD)x, (UWORD)t, TL_SBW, (UWORD)h, 0x00100810);
 
     if (!thumb_rect(obj, d, &ty, &th)) {
@@ -413,7 +438,7 @@ static void draw_thumb(Object *obj, struct TLData *d, LONG row,
     struct AlbumThumb *th;
     LONG ox, oy;
 
-    if (!d->thumbs || !CyberGfxBase) {
+    if (!d->thumbs || !PIXOK) {
         return;
     }
     th = d->thumbs[row];
@@ -423,9 +448,9 @@ static void draw_thumb(Object *obj, struct TLData *d, LONG row,
 
     ox = x + (TL_THUMB - th->w) / 2;
     oy = y + (rh - th->h) / 2;
-    WritePixelArray((APTR)th->rgb, 0, 0, (UWORD)(th->w * 3), _rp(obj),
+    WritePixelArrayMode((APTR)th->rgb, 0, 0, (UWORD)(th->w * PIXBPP), _rp(obj),
                     (UWORD)ox, (UWORD)oy, (UWORD)th->w, (UWORD)th->h,
-                    RECTFMT_RGB);
+                    RECTFMT_RGB, PIX_GRAY);
 }
 
 /* Das Sendersymbol fuer TLK_RADIO: eine Antenne mit zwei Wellen.
@@ -466,6 +491,72 @@ static void draw_antenna(Object *obj, LONG x, LONG y, LONG rh, ULONG pen)
     }
 }
 
+/* d->text in d->wtext umbrechen, so dass jede Zeile in maxw passt -
+ * am letzten Leerzeichen, das noch passt, sonst hart. Der Font muss im
+ * RastPort schon gesetzt sein. */
+static void wrap_text(struct RastPort *rp, struct TLData *d, LONG maxw)
+{
+    const char *p = d->text;
+    char *o = d->wtext;
+    char *oend = d->wtext + d->wsize - 1;
+    struct TextExtent te;
+
+    if (!p || !o || maxw <= 8) {
+        return;
+    }
+    while (*p && o < oend) {
+        const char *eol = strchr(p, '\n');
+        LONG len = eol ? (LONG)(eol - p) : (LONG)strlen(p);
+
+        for (;;) {
+            ULONG fit = TextFit(rp, (STRPTR)p, (ULONG)len, &te, NULL, 1,
+                                (UWORD)maxw, 32767);
+            LONG cut = (LONG)fit, k;
+
+            if ((LONG)fit >= len) {
+                break;
+            }
+            /* Das letzte Leerzeichen innerhalb dessen, was passt. */
+            for (k = (LONG)fit; k > 0 && p[k] != ' '; k--) {
+            }
+            if (k > 0) {
+                cut = k;
+            }
+            if (cut <= 0) {
+                cut = 1;
+            }
+            if (o + cut + 1 >= oend) {
+                break;
+            }
+            memcpy(o, p, (size_t)cut);
+            o += cut;
+            *o++ = '\n';
+            p += cut;
+            len -= cut;
+            while (len > 0 && *p == ' ') {
+                p++;
+                len--;
+            }
+        }
+        if (o + len + 1 >= oend) {
+            len = (LONG)(oend - o - 1);
+        }
+        if (len > 0) {
+            memcpy(o, p, (size_t)len);
+            o += len;
+        }
+        p += len;
+        if (*p == '\n') {
+            *o++ = '\n';
+            p++;
+        } else if (*p) {
+            break;                      /* Puffer voll */
+        }
+    }
+    *o = '\0';
+    d->wrap_w = maxw;
+}
+
 static ULONG tl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
 {
     struct TLData *d = INST_DATA(cl, obj);
@@ -493,7 +584,7 @@ static ULONG tl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
 
     /* Die Ueberschrift steht im Kopfstreifen und rollt nicht mit. */
     if (d->title[0]) {
-        SetAPen(rp, _pens(obj)[MPEN_SHINE]);
+        SetAPen(rp, MPEN(obj, MPEN_SHINE));
         Move(rp, l + PAD_X,
              _mtop(obj) + TL_HEAD_PAD / 2 + _font(obj)->tf_Baseline);
         Text(rp, (STRPTR)d->title, (LONG)strlen(d->title));
@@ -504,12 +595,23 @@ static ULONG tl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
     h = list_height(obj, d);
 
     rh = row_height_kind(obj, d);
-    rows = count_rows(d);
-    visible = h / rh;
 
     /* Alle Spaltenmasse rechnen ab hier mit der Breite OHNE Rollleiste -
      * sonst schoebe sich die rechtsbuendige Dauer darunter. */
     cw = content_width(obj);
+
+    /* Liedtext auf die Breite der Textspalte umbrechen (lw = rw = 0,
+     * siehe unten). Nur wenn sich die Breite geaendert hat. */
+    if (d->kind == TLK_TEXT && d->wtext && d->text
+            && d->wrap_w != cw - 4 * PAD_X) {
+        wrap_text(rp, d, cw - 4 * PAD_X);
+    }
+
+    rows = count_rows(d);
+    visible = h / rh;
+    if (d->first > 0 && d->first > rows - visible) {
+        d->first = (rows > visible) ? rows - visible : 0;
+    }
 
     /* Spaltenbreiten. Bei Titeln ist links nur die Nummer, bei Alben der
      * Interpret - deshalb unterschiedlich breit. */
@@ -559,17 +661,21 @@ static ULONG tl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
             if (g0 > 255) { g0 = 255; }
             if (b0 > 255) { b0 = 255; }
 
-            if (CyberGfxBase) {
+#ifdef AMI_ECS
+            ecs_fill_pen(rp, l, y, cw, rh, EPEN_ALBLT);
+#else
+            if (PIXOK) {
                 FillPixelArray(rp, (UWORD)l, (UWORD)y, (UWORD)cw, (UWORD)rh,
                                ((ULONG)r0 << 16) | ((ULONG)g0 << 8)
                              | (ULONG)b0);
             }
+#endif
         }
 
         /* Der laufende Titel hebt sich zusaetzlich ab. */
-        pen = _pens(obj)[(row == d->playing) ? MPEN_SHINE : MPEN_HALFSHINE];
+        pen = MPEN(obj, (row == d->playing) ? MPEN_SHINE : MPEN_HALFSHINE);
         if (row == d->active) {
-            pen = _pens(obj)[MPEN_SHINE];
+            pen = MPEN(obj, MPEN_SHINE);
         }
 
         if (d->kind == TLK_RADIO) {
@@ -586,7 +692,7 @@ static ULONG tl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
              * statt der Homepage. HALFSHADOW wie bei den frueher toten
              * Eintraegen der Seitenleiste. */
             if (r && r->unplayable) {
-                pen = _pens(obj)[MPEN_HALFSHADOW];
+                pen = MPEN(obj, MPEN_HALFSHADOW);
             }
 
             /* Das Sendercover, sobald es da ist - bis dahin, und bei
@@ -891,6 +997,9 @@ static ULONG tl_dispose(struct IClass *cl, Object *obj, Msg msg)
     if (d->buf) {
         free(d->buf);
     }
+    if (d->wtext) {
+        FreeVec(d->wtext);
+    }
     return DoSuperMethodA(cl, obj, msg);
 }
 
@@ -1057,6 +1166,17 @@ static ULONG tl_settext(struct IClass *cl, Object *obj,
 
     d->text = msg->text;
     d->first = 0;
+    if (d->wtext) {
+        FreeVec(d->wtext);
+        d->wtext = NULL;
+    }
+    d->wrap_w = -1;
+    if (d->text && d->kind == TLK_TEXT) {
+        /* Jeder Umbruch ersetzt ein Leerzeichen oder kommt hinzu - mehr
+         * als doppelt so lang wird es nie. */
+        d->wsize = 2 * (LONG)strlen(d->text) + 2;
+        d->wtext = AllocVec((ULONG)d->wsize, MEMF_ANY);
+    }
     MUI_Redraw(obj, MADF_DRAWOBJECT);
     return 0;
 }

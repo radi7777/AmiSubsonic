@@ -21,6 +21,7 @@
 #include <ctype.h>
 
 #include "amisub.h"
+#include "cover.h"
 #include "md5.h"
 
 struct Library *SocketBase = NULL;
@@ -273,6 +274,97 @@ void list_free(struct SubList *l)
     l->capacity = 0;
 }
 
+/* Eine Liste auf Platte: "ASL1", Eintragsgroesse, Anzahl, Groesse des
+ * Zusatzes, dann der Zusatz und die Eintraege als Block. Die Eintraege
+ * sind feste Strukturen ohne Zeiger (Album, Song, Radio) - so ist
+ * Speichern ein Write und Laden ein Read. Stimmt die Eintragsgroesse
+ * nicht (andere Programmfassung), gilt die Datei als nicht da. */
+static BOOL put_long(BPTR fh, ULONG v)
+{
+    UBYTE b[4];
+
+    b[0] = (UBYTE)(v >> 24);
+    b[1] = (UBYTE)(v >> 16);
+    b[2] = (UBYTE)(v >> 8);
+    b[3] = (UBYTE)v;
+    return Write(fh, b, 4) == 4;
+}
+
+static BOOL get_long(BPTR fh, ULONG *v)
+{
+    UBYTE b[4];
+
+    if (Read(fh, b, 4) != 4) {
+        return FALSE;
+    }
+    *v = ((ULONG)b[0] << 24) | ((ULONG)b[1] << 16) | ((ULONG)b[2] << 8)
+       | (ULONG)b[3];
+    return TRUE;
+}
+
+BOOL list_save(const char *path, struct SubList *l, const void *extra,
+               LONG extrasize)
+{
+    BPTR fh;
+    LONG bytes = (LONG)l->count * (LONG)l->itemsize;
+    BOOL ok;
+
+    fh = Open((STRPTR)path, MODE_NEWFILE);
+    if (!fh) {
+        return FALSE;
+    }
+    ok = Write(fh, "ASL1", 4) == 4
+      && put_long(fh, (ULONG)l->itemsize)
+      && put_long(fh, (ULONG)l->count)
+      && put_long(fh, (ULONG)extrasize)
+      && (extrasize <= 0 || Write(fh, (APTR)extra, extrasize) == extrasize)
+      && (bytes <= 0 || Write(fh, l->items, bytes) == bytes);
+    Close(fh);
+    if (!ok) {
+        DeleteFile((STRPTR)path);   /* halbe Datei gaelte als gueltig */
+    }
+    return ok;
+}
+
+BOOL list_load(const char *path, struct SubList *l, void *extra,
+               LONG extrasize)
+{
+    BPTR fh;
+    char magic[4];
+    ULONG isz, cnt, xsz;
+    void *items = NULL;
+    BOOL ok = FALSE;
+
+    fh = Open((STRPTR)path, MODE_OLDFILE);
+    if (!fh) {
+        return FALSE;
+    }
+    if (Read(fh, magic, 4) == 4 && memcmp(magic, "ASL1", 4) == 0
+            && get_long(fh, &isz) && get_long(fh, &cnt)
+            && get_long(fh, &xsz)
+            && isz == (ULONG)l->itemsize && xsz == (ULONG)extrasize
+            && cnt < 100000UL) {
+        LONG bytes = (LONG)cnt * (LONG)isz;
+
+        if (extrasize <= 0 || Read(fh, extra, extrasize) == extrasize) {
+            items = (cnt > 0) ? malloc((size_t)bytes) : NULL;
+            if (cnt == 0 || (items && Read(fh, items, bytes) == bytes)) {
+                list_free(l);
+                l->items = items;
+                l->count = (int)cnt;
+                l->capacity = (int)cnt;
+                items = NULL;
+                ok = TRUE;
+            }
+        }
+    }
+    if (items) {
+        free(items);
+    }
+    Close(fh);
+    return ok;
+}
+
 void *list_get(struct SubList *l, int index)
 {
     if (index < 0 || index >= l->count) {
@@ -407,6 +499,11 @@ static int prefs_read_file(struct Prefs *p, const char *path)
             if (p->ahiunit < 0 || p->ahiunit > 3) {
                 p->ahiunit = 0;
             }
+        } else if (stricmp(line, "quality") == 0) {
+            p->quality = atoi(eq + 1);
+            if (p->quality < 0 || p->quality > 2) {
+                p->quality = 1;
+            }
         } else if (stricmp(line, "visfps") == 0) {
             p->visfps = atoi(eq + 1);
             if (p->visfps != 0 && p->visfps != 15 && p->visfps != 20 &&
@@ -435,6 +532,7 @@ int prefs_load(struct Prefs *p)
     memset(p, 0, sizeof(*p));
     p->port = 4533;             /* Navidromes Vorgabe */
     p->visfps = 30;             /* auch fuer alte Prefs ohne die Zeile */
+    p->quality = 1;             /* ECS: Medium, siehe amisub.h */
 
     sprintf(path, "%s/%s", PREFS_DIR_ENV, PREFS_FILE);
     if (!prefs_read_file(p, path)) {
@@ -512,6 +610,9 @@ static int prefs_write_one(struct Prefs *p, const char *dir)
     FPrintf(fh, "; eingestellt, nicht hier.\n");
     FPrintf(fh, "ahiunit=%ld\n", (LONG)p->ahiunit);
     FPrintf(fh, ";\n");
+    FPrintf(fh, "; Nur 68030/ECS-Fassung: Tonqualitaet 0 Low, 1 Medium, 2 High.\n");
+    FPrintf(fh, "quality=%ld\n", (LONG)p->quality);
+    FPrintf(fh, ";\n");
     FPrintf(fh, "; Bilder je Sekunde des Visualizers: 0 (aus), 15, 20, 30, 60.\n");
     FPrintf(fh, "visfps=%ld\n", (LONG)p->visfps);
     FPrintf(fh, ";\n");
@@ -569,11 +670,87 @@ struct Library *AmiSSLExtBase = NULL;
 static SSL_CTX *g_ctx = NULL;
 static LONG     g_ssl_errno = 0;
 
-/* Eine Verbindung. ssl == NULL heisst nacktes HTTP. */
+/* Eine Verbindung. ssl == NULL heisst nacktes HTTP. host merkt sich
+ * ssl_handshake() fuer den Sitzungsspeicher. */
 struct Conn {
     int  sock;
     SSL *ssl;
+    char host[128];
 };
+
+/* TLS-Sitzungen zum Wiederaufnehmen, eine je Rechner.
+ *
+ * Gemessen am 13.10.2026 auf einem 68030 mit 50 MHz (TF536): JEDER
+ * volle Handschlag kostet dort rund 20 s - ein Befehl mit zwei
+ * Verbindungen 44 s, egal ob X25519 oder P-256. Eine wieder
+ * aufgenommene Sitzung spart die Pruefung der Zertifikatskette.
+ *
+ * Nur der Prozess, dem AmiSSL gehoert, fasst das an (siehe netjob.h). */
+#define SSL_SESS_SLOTS 4
+static struct {
+    char         host[128];
+    SSL_SESSION *sess;
+} g_sess[SSL_SESS_SLOTS];
+static int g_sess_next = 0;
+
+static SSL_SESSION *sess_find(const char *host)
+{
+    int i;
+
+    for (i = 0; i < SSL_SESS_SLOTS; i++) {
+        if (g_sess[i].sess && stricmp(g_sess[i].host, host) == 0) {
+            return g_sess[i].sess;
+        }
+    }
+    return NULL;
+}
+
+/* Sitzung einer Verbindung merken, kurz bevor sie geschlossen wird. In
+ * TLS 1.3 kommt das Ticket erst NACH dem Handschlag mit den ersten
+ * Daten - zum Schliessen hin ist es sicher da. */
+static void sess_store(struct Conn *c)
+{
+    SSL_SESSION *s;
+    int i;
+
+    if (!c->ssl || !c->host[0]) {
+        return;
+    }
+    s = SSL_get1_session(c->ssl);
+    if (!s) {
+        return;
+    }
+    if (!SSL_SESSION_is_resumable(s)) {
+        SSL_SESSION_free(s);
+        return;
+    }
+    for (i = 0; i < SSL_SESS_SLOTS; i++) {
+        if (g_sess[i].sess && stricmp(g_sess[i].host, c->host) == 0) {
+            break;
+        }
+    }
+    if (i == SSL_SESS_SLOTS) {
+        i = g_sess_next;
+        g_sess_next = (g_sess_next + 1) % SSL_SESS_SLOTS;
+    }
+    if (g_sess[i].sess) {
+        SSL_SESSION_free(g_sess[i].sess);
+    }
+    strcpy(g_sess[i].host, c->host);
+    g_sess[i].sess = s;
+}
+
+static void sess_free_all(void)
+{
+    int i;
+
+    for (i = 0; i < SSL_SESS_SLOTS; i++) {
+        if (g_sess[i].sess) {
+            SSL_SESSION_free(g_sess[i].sess);
+            g_sess[i].sess = NULL;
+        }
+    }
+}
 
 /* Bibliotheken werden EINMAL geoeffnet und bis zum Programmende offen
  * gehalten - anders als bei AmiHomeassist, wo bsdsocket je Anfrage auf-
@@ -709,6 +886,7 @@ static int ssl_ensure(void)
 
 void sub_cleanup(void)
 {
+    sess_free_all();
     if (g_ctx) {
         SSL_CTX_free(g_ctx);
         g_ctx = NULL;
@@ -846,6 +1024,7 @@ static long conn_recv(struct Conn *c, char *buf, long len)
 static void conn_close(struct Conn *c)
 {
     if (c->ssl) {
+        sess_store(c);
         SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
         c->ssl = NULL;
@@ -867,6 +1046,17 @@ static int ssl_handshake(struct Conn *c, const char *host)
         return fail(SUB_ENET, "SSL_new failed");
     }
     SSL_set_fd(c->ssl, c->sock);
+
+    /* Bekannte Sitzung anbieten. Lehnt der Server sie ab, wird ganz
+     * normal voll verhandelt - schaden kann es nicht. */
+    {
+        SSL_SESSION *s = sess_find(host);
+
+        if (s) {
+            SSL_set_session(c->ssl, s);
+        }
+    }
+    copy_field(c->host, sizeof(c->host), host);
 
     /* SNI. Ohne das kommt hinter einem Reverse Proxy - und die Fritz!Box
      * mit MyFritz ist genau das - das falsche oder gar kein Zertifikat
@@ -2029,6 +2219,51 @@ int sub_stream_url(struct Prefs *p, const char *songid, char *out, int outsize)
  * waere alles umsonst geholt. */
 static long radio_read_head(struct Conn *c, char *head, long size);
 
+#ifdef AMI_ECS
+/* Die ECS-Fassung bittet den Server um eine eigene, kleine Fassung: MP3
+ * mono, 22 kHz, 48 kbps. "mp3a22" ist ein Zielformat, das der Anwender
+ * in SEINEM Navidrome angelegt hat (13.10.2026) - kein anderer Client
+ * fragt danach, Auto und Telefon behalten die volle Qualitaet. Gemessen
+ * auf der TF536: 38 % der Maschine statt 60 bis 70 % beim Original.
+ *
+ * Ein fremder Server kennt das Format nicht. Dann antwortet Navidrome
+ * MIT ffmpeg in seinem Standardformat (gemessen: audio/ogg), OHNE
+ * ffmpeg mit einem Fehler. Beides heisst: zurueck auf format=raw, und
+ * das fuer den Rest der Sitzung (g_tc_bad).
+ *
+ * Eine umgerechnete Fassung hat keine Byte-Stellen, nur Zeit: Range geht
+ * nicht, Navidrome nimmt timeOffset in Sekunden. Bei fester Bitrate
+ * entspricht jede Sekunde TC_KBPS*125 Bytes - so rechnet der Rest des
+ * Programms weiter mit Bytes, als waere es eine Datei mit bekannter
+ * Groesse. */
+/* High (quality 2) holt mp3a16: 16 kHz mono, 40 kbps - mpega spielt
+ * das ungeteilt, also mit Hoehen bis 8 kHz statt 5,5. */
+#define TC_FMT   ((p->quality >= 2) ? "mp3a16" : "mp3a22")
+#define TC_KBPS  ((p->quality >= 2) ? 40L : 48L)
+static BOOL g_tc_bad = FALSE;
+
+/* Wert einer Kopfzeile ("Name:") in out, leer wenn sie fehlt. */
+static void head_value(const char *head, const char *name, char *out,
+                       int size)
+{
+    const char *v = strstr(head, name);
+    int n = 0;
+
+    out[0] = '\0';
+    if (!v) {
+        return;
+    }
+    v += strlen(name);
+    while (*v == ' ') {
+        v++;
+    }
+    while (*v && *v != '\r' && *v != '\n' && n < size - 1) {
+        out[n++] = *v++;
+    }
+    out[n] = '\0';
+}
+#endif
+
 int sub_stream_open(struct Prefs *p, const char *songid, long offset,
                     struct SubStream *st)
 {
@@ -2065,6 +2300,12 @@ int sub_stream_open(struct Prefs *p, const char *songid, long offset,
     }
 
     url_encode(songid, encid, sizeof(encid));
+#ifdef AMI_ECS
+    if (!g_tc_bad) {
+        sprintf(extra, "&id=%s&format=%s&maxBitRate=%ld&timeOffset=%ld",
+                encid, TC_FMT, TC_KBPS, offset / (TC_KBPS * 125L));
+    } else
+#endif
     sprintf(extra, "&id=%s&format=raw", encid);
     build_path(p, "stream", extra, path, sizeof(path));
 
@@ -2128,6 +2369,19 @@ int sub_stream_open(struct Prefs *p, const char *songid, long offset,
     /* HTTP/1.1 mit Range. Bei offset 0 steht trotzdem ein Range-Kopf
      * drin - dann antwortet der Server mit 206 statt 200, und beide
      * Faelle sind unten gleich zu behandeln. */
+#ifdef AMI_ECS
+    if (!g_tc_bad) {
+        /* HTTP/1.0: sonst schickt der Server die umgerechnete Fassung in
+         * Stuecken (chunked, gemessen) - ihre Laenge kennt er vorher
+         * nicht. So endet sie einfach mit der Verbindung. */
+        sprintf(req,
+                "GET %s HTTP/1.0\r\n"
+                "Host: %s\r\n"
+                "User-Agent: %s\r\n"
+                "\r\n",
+                path, p->host, SUB_CLIENT "/" SUB_VERSION);
+    } else
+#endif
     sprintf(req,
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -2161,6 +2415,40 @@ int sub_stream_open(struct Prefs *p, const char *songid, long offset,
         conn_close(&c);
         return fail(SUB_EHTTP, "no valid HTTP response");
     }
+#ifdef AMI_ECS
+    if (!g_tc_bad) {
+        char ct[40], dur[24];
+
+        /* Eigene Fassung: der Content-Type ist LEER (Navidrome kennt die
+         * Endung nicht). Steht dort etwas anderes als MPEG, hat der
+         * Server das Format nicht und in sein Standardformat gewandelt. */
+        head_value(head, "Content-Type:", ct, sizeof(ct));
+        if (status != 200 || (ct[0] && !strstr(ct, "mpeg"))) {
+            conn_close(&c);
+            g_tc_bad = TRUE;
+            return sub_stream_open(p, songid, offset, st);
+        }
+        /* Laenge aus der Dauer ("186.54" Sekunden), ganzzahlig. */
+        head_value(head, "X-Content-Duration:", dur, sizeof(dur));
+        if (dur[0]) {
+            long sec = atol(dur);
+            const char *dot = strchr(dur, '.');
+            long ms = sec * 1000L;
+
+            if (dot && dot[1] >= '0' && dot[1] <= '9') {
+                ms += (dot[1] - '0') * 100L;
+            }
+            st->total = ms / 8L * TC_KBPS;
+        }
+        st->sock = c.sock;
+        st->ssl  = c.ssl;
+        /* Die Stelle, an der der Server tatsaechlich anfaengt: auf ganze
+         * Sekunden abgerundet. */
+        st->pos  = offset / (TC_KBPS * 125L) * (TC_KBPS * 125L);
+        copy_field(st->id, sizeof(st->id), songid);
+        return SUB_OK;
+    }
+#endif
     if (status != 200 && status != 206) {
         char msg[96];
 
@@ -2860,6 +3148,19 @@ int sub_range_probe(struct Prefs *p, const char *songid, long offset,
         }
     }
 
+#ifdef AMI_ECS
+    if (!g_tc_bad) {
+        /* HTTP/1.0: sonst schickt der Server die umgerechnete Fassung in
+         * Stuecken (chunked, gemessen) - ihre Laenge kennt er vorher
+         * nicht. So endet sie einfach mit der Verbindung. */
+        sprintf(req,
+                "GET %s HTTP/1.0\r\n"
+                "Host: %s\r\n"
+                "User-Agent: %s\r\n"
+                "\r\n",
+                path, p->host, SUB_CLIENT "/" SUB_VERSION);
+    } else
+#endif
     sprintf(req,
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -3007,6 +3308,8 @@ int sub_get_cover(struct Prefs *p, const char *coverartid, int maxsize,
  * Die Platten hier laufen auf PFS3 (107 Zeichen), Navidromes IDs sind
  * rund 22 Zeichen lang - Kuerzen ist also nicht noetig, und ein Hash
  * waere nur ein Name, den man nicht mehr zurueckuebersetzen kann. */
+#define CACHE_NAME_MAX 26
+
 void cache_path(struct Prefs *p, const char *coverartid,
                 char *out, int outsize)
 {
@@ -3034,7 +3337,7 @@ void cache_path(struct Prefs *p, const char *coverartid,
         out[n] = '\0';
     }
 
-    for (i = 0; coverartid[i]; i++) {
+    for (i = 0; coverartid[i] && i < CACHE_NAME_MAX; i++) {
         char c = coverartid[i];
 
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
@@ -3044,8 +3347,93 @@ void cache_path(struct Prefs *p, const char *coverartid,
             out[n++] = '_';
         }
     }
+    /* Laengere Kennungen (Cover mit Hash, Hoerbuch-UUIDs) werden gekuerzt
+     * und bekommen einen Streuwert der GANZEN Kennung angehaengt. FFS
+     * nimmt nur 30 Zeichen: auf der TF536 wurde ein 38 Zeichen langer
+     * Name stillschweigend abgeschnitten, und das Umbenennen danach fand
+     * die Datei nicht mehr (13.10.2026). 17 + 1 + 8 + ".ecs" = 30. */
+    if (coverartid[i]) {
+        ULONG hsh = 2166136261UL;
+        const char *q;
+
+        n -= CACHE_NAME_MAX - 17;
+        for (q = coverartid; *q; q++) {
+            hsh = (hsh ^ (UBYTE)*q) * 16777619UL;
+        }
+        sprintf(out + n, "-%08lx", (unsigned long)(hsh & 0xffffffffUL));
+        n += 9;
+    }
     out[n] = '\0';
+#ifdef AMI_ECS
+    /* Die ECS-Fassung legt das Cover fertig gerastert ab (cover.h); das
+     * JPEG ist nach dem Umwandeln weg (Wunsch des Anwenders). */
+    strcat(out, ".ecs");
+#else
     strcat(out, ".jpg");
+#endif
+}
+
+BOOL cache_from_jpg(const char *out)
+{
+#ifdef AMI_ECS
+    char tmp[260];
+    int n = (int)strlen(out);
+    BPTR lock;
+
+    /* Ein JPEG aus einem frueheren Lauf liegt schon da: umwandeln statt
+     * neu holen - die Plipbox ist der langsamste Teil (Anwender,
+     * 13.10.2026). */
+    if (n < 5 || n >= (int)sizeof(tmp)) {
+        return FALSE;
+    }
+    strcpy(tmp, out);
+    strcpy(tmp + n - 4, ".jpg");
+    lock = Lock((STRPTR)tmp, ACCESS_READ);
+    if (!lock) {
+        return FALSE;
+    }
+    UnLock(lock);
+    if (ecs_cover_convert(tmp, out)) {
+        DeleteFile((STRPTR)tmp);
+        return TRUE;
+    }
+    /* Kaputt: weg damit, dann wird es neu geholt. */
+    DeleteFile((STRPTR)tmp);
+#else
+    (void)out;
+#endif
+    return FALSE;
+}
+
+int cache_finish(const char *out)
+{
+#ifdef AMI_ECS
+    char tmp[260];
+    int n = (int)strlen(out);
+
+    /* Der Download hat das JPEG unter dem .ecs-Namen abgelegt: umbenennen,
+     * umwandeln, JPEG loeschen. Das Umwandeln laeuft hier, im Netzprozess
+     * und mit niedrigerer Prioritaet - die Oberflaeche liest danach nur
+     * noch fertige Stifte. */
+    if (n < 5 || n >= (int)sizeof(tmp)) {
+        return fail(SUB_EMEM, "cache path too long");
+    }
+    strcpy(tmp, out);
+    strcpy(tmp + n - 4, ".jpg");
+    DeleteFile((STRPTR)tmp);
+    if (!Rename((STRPTR)out, (STRPTR)tmp)) {
+        DeleteFile((STRPTR)out);
+        return fail(SUB_EMEM, "cannot rename cover in cache");
+    }
+    if (!ecs_cover_convert(tmp, out)) {
+        DeleteFile((STRPTR)tmp);
+        return fail(SUB_EAPI, "cover cannot be decoded");
+    }
+    DeleteFile((STRPTR)tmp);
+#else
+    (void)out;
+#endif
+    return SUB_OK;
 }
 
 /* Legt ein Verzeichnis samt ALLER fehlenden Stufen davor an.
@@ -3151,7 +3539,7 @@ int sub_get_cover_cached(struct Prefs *p, const char *coverartid,
         return fail(SUB_EAPI, "no cover available");
     }
 
-    if (cache_have(p, coverartid)) {
+    if (cache_have(p, coverartid) || cache_from_jpg(out)) {
         return SUB_OK;
     }
 
@@ -3161,6 +3549,9 @@ int sub_get_cover_cached(struct Prefs *p, const char *coverartid,
     }
 
     rc = sub_get_cover(p, coverartid, maxsize, out);
+    if (rc == SUB_OK) {
+        rc = cache_finish(out);
+    }
     if (rc != SUB_OK) {
         /* Eine halb geschriebene Datei waere schlimmer als gar keine:
          * beim naechsten Start laege sie da und wuerde nie erneuert. */

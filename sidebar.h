@@ -46,6 +46,7 @@
 #define SB_POD_SCAN      12
 /* Nur den eigenen Ordner neu durchsuchen. */
 #define SB_FOLDER_SCAN   13
+#define SB_QUIT          14   /* nur ECS: Fenster ohne Schliessknopf */
 
 /* Kein Eintrag markiert. Die Playeransicht ist kein Punkt der
  * Gliederung - waehrend sie offen ist, soll die Leiste nicht behaupten,

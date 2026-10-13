@@ -16,6 +16,10 @@
 #include <string.h>
 
 #include "cover.h"
+#include "amisub.h"
+#ifdef AMI_ECS
+#include "ecsgfx.h"
+#endif
 
 struct Library *DataTypesBase = NULL;
 
@@ -382,6 +386,22 @@ BOOL cover_dominant(const char *path, ULONG *rgb)
     struct CoverImage img;
     BOOL ok;
 
+#ifdef AMI_ECS
+    /* Steht fertig im Kopf der .ecs-Datei - kein JPEG. */
+    {
+        char ep[256];
+
+        ecs_cover_path(path, ep, sizeof(ep));
+        if (ep[0] && ecs_cover_read(ep, -1, NULL, NULL, NULL, rgb)) {
+            return TRUE;
+        }
+        if (ep[0] && strcmp(ep, path) != 0 && ecs_cover_convert(path, ep)
+                && ecs_cover_read(ep, -1, NULL, NULL, NULL, rgb)) {
+            return TRUE;
+        }
+        return FALSE;
+    }
+#endif
     if (!cover_load(path, &img)) {
         return FALSE;
     }
@@ -389,6 +409,320 @@ BOOL cover_dominant(const char *path, ULONG *rgb)
     cover_unload(&img);
     return ok;
 }
+
+/* ------------------------------------------------------------------ */
+/* Miniaturen                                                          */
+/* ------------------------------------------------------------------ */
+
+BOOL cover_thumb(const char *path, LONG box, UBYTE **out, LONG *w, LONG *h)
+{
+    struct CoverImage img;
+    BOOL ok;
+
+    *out = NULL;
+#ifdef AMI_ECS
+    {
+        char ep[256];
+        /* COVER_PX ist das Farbbild der Playeransicht. */
+        int kind = (box == TL_THUMB_SIZE) ? ECS_KIND_LIST
+                 : (box == COVER_PX)      ? ECS_KIND_COLOUR
+                 :                          ECS_KIND_GRID;
+
+        ecs_cover_path(path, ep, sizeof(ep));
+        if (!ep[0]) {
+            return FALSE;
+        }
+        if (ecs_cover_read(ep, kind, out, w, h, NULL)) {
+            return TRUE;
+        }
+        /* Ein Bild ausserhalb des Caches (folder.jpg) wird beim ersten
+         * Mal hier umgewandelt - danach liegt es ebenfalls fertig da. */
+        if (strcmp(ep, path) != 0 && ecs_cover_convert(path, ep)) {
+            return ecs_cover_read(ep, kind, out, w, h, NULL);
+        }
+        return FALSE;
+    }
+#endif
+    if (!cover_load(path, &img)) {
+        return FALSE;
+    }
+    ok = cover_scale_rgb(&img, box, FALSE, out, w, h);
+    cover_unload(&img);
+    return ok;
+}
+
+#ifdef AMI_ECS
+
+/* ------------------------------------------------------------------ */
+/* Die ECS-Ablage (.ecs)                                               */
+/* ------------------------------------------------------------------ */
+
+/* Aufbau, alle Zahlen big endian wie auf dem Amiga:
+ *   "ASE1"  ULONG Albumfarbe  UWORD Anzahl Teile
+ *   je Teil: UBYTE Art, UBYTE Bits je Punkt, UWORD w, UWORD h, Daten
+ * Daten dicht gepackt, das hoechste Bit zuerst. */
+#define ECS_MAGIC 0x41534531UL      /* "ASE1" */
+
+static char g_cachedir[200] = "PROGDIR:Cache";
+
+void cover_set_cachedir(const char *dir)
+{
+    if (dir && dir[0]) {
+        strncpy(g_cachedir, dir, sizeof(g_cachedir) - 1);
+        g_cachedir[sizeof(g_cachedir) - 1] = '\0';
+    }
+}
+
+void ecs_cover_path(const char *src, char *out, int size)
+{
+    int n = src ? (int)strlen(src) : 0;
+    ULONG hsh = 2166136261UL;
+    const char *q;
+
+    out[0] = '\0';
+    if (n == 0 || n + 1 > size) {
+        return;
+    }
+    if (n > 4 && stricmp(src + n - 4, ".ecs") == 0) {
+        strcpy(out, src);
+        return;
+    }
+    /* Im Cache (lo-*.jpg aus eingebetteten Bildern): gleiche Datei mit
+     * .ecs. Sonst (folder.jpg im Musikordner) ein Streuwert des Pfades -
+     * dort hinein schreiben wir nicht. */
+    if (strnicmp(src, g_cachedir, strlen(g_cachedir)) == 0 && n > 4
+            && src[n - 4] == '.') {
+        strcpy(out, src);
+        strcpy(out + n - 4, ".ecs");
+        return;
+    }
+    for (q = src; *q; q++) {
+        hsh = (hsh ^ (UBYTE)*q) * 16777619UL;
+    }
+    if ((int)strlen(g_cachedir) + 20 > size) {
+        return;
+    }
+    sprintf(out, "%s%slp-%08lx.ecs", g_cachedir,
+            (g_cachedir[strlen(g_cachedir) - 1] == ':') ? "" : "/",
+            (unsigned long)(hsh & 0xffffffffUL));
+}
+
+static BOOL put_section(BPTR fh, int kind, int bits, LONG w, LONG h,
+                        const UBYTE *val)
+{
+    UBYTE hdr[6];
+    LONG n = w * h, bytes = (n * bits + 7) / 8, i;
+    UBYTE *pk = calloc(1, (size_t)bytes);
+    BOOL ok;
+
+    if (!pk) {
+        return FALSE;
+    }
+    for (i = 0; i < n; i++) {
+        LONG bit = i * bits;
+
+        pk[bit >> 3] |= (UBYTE)(val[i] << (8 - bits - (bit & 7)));
+    }
+    hdr[0] = (UBYTE)kind;
+    hdr[1] = (UBYTE)bits;
+    hdr[2] = (UBYTE)(w >> 8);
+    hdr[3] = (UBYTE)w;
+    hdr[4] = (UBYTE)(h >> 8);
+    hdr[5] = (UBYTE)h;
+    ok = Write(fh, hdr, 6) == 6 && Write(fh, pk, bytes) == bytes;
+    free(pk);
+    return ok;
+}
+
+/* Eine Graukachel der Kantenlaenge box aus dem geladenen Bild. */
+static BOOL put_gray(BPTR fh, const struct CoverImage *img, int kind,
+                     LONG box)
+{
+    UBYTE *rgb = NULL, *lev;
+    LONG w, h;
+    BOOL ok = FALSE;
+
+    if (!cover_scale_rgb(img, box, FALSE, &rgb, &w, &h)) {
+        return FALSE;
+    }
+    lev = malloc((size_t)(w * h));
+    if (lev) {
+        ecs_dither_levels(rgb, w, h, lev);
+        ok = put_section(fh, kind, 2, w, h, lev);
+        free(lev);
+    }
+    free(rgb);
+    return ok;
+}
+
+BOOL ecs_cover_convert(const char *src, const char *dst)
+{
+    struct Task *me = FindTask(NULL);
+    BYTE oldpri;
+    struct CoverImage img;
+    ULONG dom = 0x00404040UL;
+    UBYTE hdr[10];
+    UBYTE *rgb = NULL, *pens;
+    LONG w, h;
+    BPTR fh;
+    BOOL ok = FALSE;
+
+    /* Die Oberflaeche hat Vorrang (Wunsch des Anwenders): Entpacken und
+     * Rastern kosten auf dem 68030 Sekunden, und das soll man beim
+     * Bedienen nicht merken. */
+    oldpri = SetTaskPri(me, -2);
+
+    if (!cover_load(src, &img)) {
+        SetTaskPri(me, oldpri);
+        return FALSE;
+    }
+    cover_dominant_img(&img, &dom);
+
+    fh = Open((STRPTR)dst, MODE_NEWFILE);
+    if (fh) {
+        hdr[0] = 'A'; hdr[1] = 'S'; hdr[2] = 'E'; hdr[3] = '1';
+        hdr[4] = (UBYTE)(dom >> 24);
+        hdr[5] = (UBYTE)(dom >> 16);
+        hdr[6] = (UBYTE)(dom >> 8);
+        hdr[7] = (UBYTE)dom;
+        hdr[8] = 0;
+        hdr[9] = 3;
+        ok = Write(fh, hdr, 10) == 10
+          && put_gray(fh, &img, ECS_KIND_GRID, AG_THUMB_SIZE)
+          && put_gray(fh, &img, ECS_KIND_LIST, TL_THUMB_SIZE);
+        if (ok) {
+            ok = FALSE;
+            /* grow: auch ein kleineres Bild fuellt die Flaeche. */
+            if (cover_scale_rgb(&img, COVER_PX, TRUE, &rgb, &w, &h)) {
+                pens = malloc((size_t)(w * h));
+                if (pens) {
+                    ecs_dither_colour(rgb, w, h, dom, pens);
+                    ok = put_section(fh, ECS_KIND_COLOUR, 4, w, h, pens);
+                    free(pens);
+                }
+                free(rgb);
+            }
+        }
+        Close(fh);
+        if (!ok) {
+            /* Keine halbe Datei liegen lassen - sie gaelte als fertig. */
+            DeleteFile((STRPTR)dst);
+        }
+    }
+    cover_unload(&img);
+    SetTaskPri(me, oldpri);
+    return ok;
+}
+
+BOOL ecs_cover_read(const char *path, int kind, UBYTE **pens,
+                    LONG *w, LONG *h, ULONG *dominant)
+{
+    UBYTE hdr[10], sh[6];
+    BPTR fh;
+    LONG count, i;
+    BOOL ok = FALSE;
+
+    fh = Open((STRPTR)path, MODE_OLDFILE);
+    if (!fh) {
+        return FALSE;
+    }
+    if (Read(fh, hdr, 10) != 10 || hdr[0] != 'A' || hdr[1] != 'S'
+            || hdr[2] != 'E' || hdr[3] != '1') {
+        Close(fh);
+        return FALSE;
+    }
+    if (dominant) {
+        *dominant = ((ULONG)hdr[4] << 24) | ((ULONG)hdr[5] << 16)
+                  | ((ULONG)hdr[6] << 8) | (ULONG)hdr[7];
+    }
+    if (kind < 0) {
+        Close(fh);
+        return TRUE;
+    }
+    count = ((LONG)hdr[8] << 8) | hdr[9];
+    for (i = 0; i < count; i++) {
+        LONG sw, shh, bits, n, bytes;
+
+        if (Read(fh, sh, 6) != 6) {
+            break;
+        }
+        bits = sh[1];
+        sw = ((LONG)sh[2] << 8) | sh[3];
+        shh = ((LONG)sh[4] << 8) | sh[5];
+        n = sw * shh;
+        bytes = (n * bits + 7) / 8;
+        if (sh[0] != kind) {
+            Seek(fh, bytes, OFFSET_CURRENT);
+            continue;
+        }
+        {
+            UBYTE *pk = malloc((size_t)bytes);
+            UBYTE *out = malloc((size_t)n);
+            LONG k;
+
+            if (pk && out && bits > 0 && bits <= 8
+                    && Read(fh, pk, bytes) == bytes) {
+                UBYTE mask = (UBYTE)((1 << bits) - 1);
+
+                for (k = 0; k < n; k++) {
+                    LONG bit = k * bits;
+                    UBYTE v = (UBYTE)((pk[bit >> 3] >> (8 - bits - (bit & 7)))
+                                      & mask);
+
+                    /* Graustufen 0..3 werden hier zu Stiften. */
+                    out[k] = (bits == 2) ? ecs_level_pen(v) : v;
+                }
+                *pens = out;
+                out = NULL;
+                if (w) { *w = sw; }
+                if (h) { *h = shh; }
+                ok = TRUE;
+            }
+            if (pk) { free(pk); }
+            if (out) { free(out); }
+        }
+        break;
+    }
+    Close(fh);
+    return ok;
+}
+
+BOOL cover_scale_pens(const UBYTE *src, LONG sw, LONG sh, LONG box,
+                      UBYTE **out, LONG *w, LONG *h)
+{
+    LONG dw, dh, x, y;
+    UBYTE *dst;
+
+    if (!src || sw <= 0 || sh <= 0 || box <= 0) {
+        return FALSE;
+    }
+    if (sw >= sh) {
+        dw = box;
+        dh = sh * box / sw;
+    } else {
+        dh = box;
+        dw = sw * box / sh;
+    }
+    if (dw < 1) { dw = 1; }
+    if (dh < 1) { dh = 1; }
+    dst = malloc((size_t)(dw * dh));
+    if (!dst) {
+        return FALSE;
+    }
+    for (y = 0; y < dh; y++) {
+        const UBYTE *srow = src + (y * sh / dh) * sw;
+
+        for (x = 0; x < dw; x++) {
+            dst[y * dw + x] = srow[x * sw / dw];
+        }
+    }
+    *out = dst;
+    *w = dw;
+    *h = dh;
+    return TRUE;
+}
+
+#endif
 
 /* ------------------------------------------------------------------ */
 

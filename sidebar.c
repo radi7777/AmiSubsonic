@@ -6,8 +6,7 @@
 #include <proto/intuition.h>
 #include <proto/utility.h>
 #include <proto/muimaster.h>
-#include <proto/cybergraphics.h>
-#include <cybergraphx/cybergraphics.h>
+#include "pix.h"
 #include <intuition/intuition.h>
 #include <libraries/mui.h>
 #include <clib/alib_protos.h>
@@ -22,9 +21,17 @@ extern struct Library *CyberGfxBase;     /* gehoert panel.c */
 
 static struct MUI_CustomClass *g_mcc = NULL;
 
+#ifdef AMI_ECS
+/* 640 Punkte Breite: die Leiste muss schmaler sein, und enger gesetzt,
+ * damit sie auch auf NTSC (400 Zeilen) ganz passt. */
+#define SB_WIDTH   112
+#define SB_PAD_X    10
+#define SB_PAD_Y     2
+#else
 #define SB_WIDTH   150
 #define SB_PAD_X    14
 #define SB_PAD_Y     4
+#endif
 #define SB_TOP      10
 
 /* Art eines Eintrags. */
@@ -95,6 +102,11 @@ static const struct Entry g_entries[] = {
     { "",            E_GAP,  -1 },
     { "",            E_LINE, -1 },
     { "Settings",    E_ITEM, SB_SETTINGS },
+#ifdef AMI_ECS
+    /* Das Fenster fuellt randlos den eigenen Bildschirm - ohne
+     * Schliessknopf braucht es einen Weg hinaus. */
+    { "Quit",        E_ITEM, SB_QUIT },
+#endif
 };
 
 #define SB_COUNT ((int)(sizeof(g_entries) / sizeof(g_entries[0])))
@@ -153,7 +165,7 @@ static ULONG sb_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
     /* Durchgehend schwarz, wie die Bedienleiste unten - unabhaengig vom
      * Cover. Die Leiste ist der ruhende Rahmen, in dem die Farbe der
      * Inhalte wirkt. */
-    if (CyberGfxBase) {
+    if (PIXOK) {
         FillPixelArray(rp, (UWORD)l, (UWORD)t, (UWORD)w, (UWORD)h,
                        0x00000000);
     }
@@ -179,7 +191,7 @@ static ULONG sb_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
             continue;
         }
         if (e->type == E_LINE) {
-            if (CyberGfxBase && w > 2 * SB_PAD_X) {
+            if (PIXOK && w > 2 * SB_PAD_X) {
                 FillPixelArray(rp, (UWORD)(l + SB_PAD_X), (UWORD)(y + rh / 4),
                                (UWORD)(w - 2 * SB_PAD_X), 1, SB_HEAD_RGB);
             }
@@ -187,26 +199,30 @@ static ULONG sb_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
             continue;
         }
 
-        if (e->type == E_ITEM && e->id == (int)d->active && CyberGfxBase) {
+        if (e->type == E_ITEM && e->id == (int)d->active && PIXOK) {
             /* Ein schmaler blauer Balken links statt eines gefaerbten
              * Textes: eine eigene Textfarbe braeuchte ObtainBestPen und
              * damit eine Farbe, die wieder freigegeben werden muss.
              * FillPixelArray nimmt den RGB-Wert unmittelbar. */
+#ifdef AMI_ECS
+            ecs_fill_pen(rp, l + 3, y + 1, 3, rh - 2, EPEN_BLUE);
+#else
             FillPixelArray(rp, (UWORD)(l + 4), (UWORD)(y + 2),
                            3, (UWORD)(rh - 4), 0x004C7CFE);
+#endif
         }
 
         switch (e->type) {
         case E_HEAD:
             pen = (d->headpen >= 0) ? (ULONG)d->headpen
-                                    : _pens(obj)[MPEN_HALFSHINE];
+                                    : MPEN(obj, MPEN_HALFSHINE);
             break;
         case E_DEAD:
-            pen = _pens(obj)[MPEN_HALFSHADOW];
+            pen = MPEN(obj, MPEN_HALFSHADOW);
             break;
         default:
-            pen = _pens(obj)[(e->id == (int)d->active)
-                             ? MPEN_SHINE : MPEN_HALFSHINE];
+            pen = MPEN(obj, (e->id == (int)d->active)
+                             ? MPEN_SHINE : MPEN_HALFSHINE);
             break;
         }
 

@@ -11,8 +11,7 @@
 #include <proto/intuition.h>
 #include <proto/utility.h>
 #include <proto/muimaster.h>
-#include <proto/cybergraphics.h>
-#include <cybergraphx/cybergraphics.h>
+#include "pix.h"
 #include <intuition/intuition.h>
 #include <libraries/mui.h>
 #include <clib/alib_protos.h>
@@ -118,7 +117,7 @@ struct MUI_CustomClass *pl_class(void)
 
 static void fill_rect(Object *obj, LONG x, LONG y, LONG w, LONG h, ULONG rgb)
 {
-    if (w > 0 && h > 0 && CyberGfxBase) {
+    if (w > 0 && h > 0 && PIXOK) {
         FillPixelArray(_rp(obj), (UWORD)x, (UWORD)y, (UWORD)w, (UWORD)h, rgb);
     }
 }
@@ -202,7 +201,7 @@ static void draw_play_button(Object *obj, LONG cx, LONG cy, LONG r,
     LONG bw  = r * 8 * 3 / 20;      /* halbe Breite eines Pausenbalkens */
     LONG bg  = r * 8 * 2 / 10;      /* Abstand der Balken von der Mitte */
 
-    if (!CyberGfxBase || r < 4 || r > BTN_RMAX) {
+    if (!PIXOK || r < 4 || r > BTN_RMAX) {
         /* Notnagel: lieber der alte, kantige Kreis als gar kein Knopf. */
         fill_circle(obj, cx, cy, r, COL_WHITE);
         return;
@@ -323,7 +322,13 @@ static void load_cover(struct PlData *d)
         d->img_ok = FALSE;
     }
     if (d->coverfile[0]) {
+#ifdef AMI_ECS
+        /* Die Graukachel der Bildwand, fertig gerastert (cover.h). */
+        d->img_ok = cover_thumb(d->coverfile, AG_THUMB_SIZE, &d->img.rgb,
+                                &d->img.w, &d->img.h);
+#else
         d->img_ok = cover_load(d->coverfile, &d->img);
+#endif
     }
 }
 
@@ -342,21 +347,23 @@ static BOOL make_thumb(struct PlData *d, LONG size)
         return TRUE;
     }
 
-    dst = malloc((size_t)size * (size_t)size * 3);
+    dst = malloc((size_t)size * (size_t)size * PIXBPP);
     if (!dst) {
         return FALSE;
     }
 
     for (y = 0; y < size; y++) {
         const UBYTE *srow = d->img.rgb
-                          + (long)(y * d->img.h / size) * d->img.w * 3;
-        UBYTE *drow = dst + (long)y * size * 3;
+                          + (long)(y * d->img.h / size) * d->img.w * PIXBPP;
+        UBYTE *drow = dst + (long)y * size * PIXBPP;
 
         for (x = 0; x < size; x++) {
-            const UBYTE *s = srow + (long)(x * d->img.w / size) * 3;
+            const UBYTE *s = srow + (long)(x * d->img.w / size) * PIXBPP;
             *drow++ = s[0];
+#ifndef AMI_ECS
             *drow++ = s[1];
             *drow++ = s[2];
+#endif
         }
     }
 
@@ -489,9 +496,9 @@ static void draw_progress(Object *obj, struct PlData *d, LONG fh)
         aw = TIME_W;
     }
     draw_text(obj, a, d->bar_x - 6 - aw, d->bar_y - fh / 2, aw,
-              _pens(obj)[MPEN_HALFSHINE], FALSE);
+              MPEN(obj, MPEN_HALFSHINE), FALSE);
     draw_text(obj, b, d->bar_x + d->bar_w + 6, d->bar_y - fh / 2, TIME_W,
-              _pens(obj)[MPEN_HALFSHINE], FALSE);
+              MPEN(obj, MPEN_HALFSHINE), FALSE);
 
     if (d->total > 0 && d->pos > 0) {
         done = d->bar_w * d->pos / d->total;
@@ -568,10 +575,10 @@ static ULONG pl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
     if (thumb > 48) {
         thumb = 48;
     }
-    if (d->img_ok && make_thumb(d, thumb) && CyberGfxBase) {
-        WritePixelArray(d->thumb, 0, 0, (UWORD)(thumb * 3), _rp(obj),
+    if (d->img_ok && make_thumb(d, thumb) && PIXOK) {
+        WritePixelArrayMode(d->thumb, 0, 0, (UWORD)(thumb * PIXBPP), _rp(obj),
                         (UWORD)(l + THUMB_PAD), (UWORD)(t + THUMB_PAD),
-                        (UWORD)thumb, (UWORD)thumb, RECTFMT_RGB);
+                        (UWORD)thumb, (UWORD)thumb, RECTFMT_RGB, PIX_GRAY);
     }
     /* Anklickbar auch ohne Bild - ein Sender ohne Cover soll trotzdem
      * zu seiner Liste fuehren. */
@@ -584,11 +591,11 @@ static ULONG pl_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
         LONG tw = (w / 3) - (tx - l) - 8;
 
         draw_text(obj, d->title,  tx, ty,              tw,
-                  _pens(obj)[MPEN_SHINE], TRUE);
+                  MPEN(obj, MPEN_SHINE), TRUE);
         draw_text(obj, d->artist, tx, ty + fh + 2,     tw,
-                  _pens(obj)[MPEN_HALFSHINE], FALSE);
+                  MPEN(obj, MPEN_HALFSHINE), FALSE);
         draw_text(obj, d->album,  tx, ty + 2 * fh + 4, tw,
-                  _pens(obj)[MPEN_HALFSHINE], FALSE);
+                  MPEN(obj, MPEN_HALFSHINE), FALSE);
     }
 
     /* ---- Mitte: Knoepfe ---- */

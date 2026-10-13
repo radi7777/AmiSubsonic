@@ -22,8 +22,7 @@
 #include <proto/intuition.h>
 #include <proto/utility.h>
 #include <proto/muimaster.h>
-#include <proto/cybergraphics.h>
-#include <cybergraphx/cybergraphics.h>
+#include "pix.h"
 #include <devices/timer.h>
 #include <proto/timer.h>
 #include <libraries/mui.h>
@@ -1119,7 +1118,7 @@ static ULONG vis_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
     t = _mtop(obj);
     w = _mwidth(obj);
     h = _mheight(obj);
-    if (w <= 0 || h <= 0 || !CyberGfxBase) {
+    if (w <= 0 || h <= 0 || !PIXOK) {
         return 0;
     }
 

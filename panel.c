@@ -6,8 +6,7 @@
 #include <proto/intuition.h>
 #include <proto/utility.h>
 #include <proto/muimaster.h>
-#include <proto/cybergraphics.h>
-#include <cybergraphx/cybergraphics.h>
+#include "pix.h"
 #include <graphics/gfxmacros.h>
 #include <libraries/mui.h>
 #include <clib/alib_protos.h>
@@ -17,6 +16,7 @@
 
 #include "panel.h"
 #include "cover.h"
+#include "amisub.h"
 
 extern struct Library *MUIMasterBase;
 struct Library *CyberGfxBase = NULL;
@@ -90,7 +90,13 @@ static void load_cover(struct PanelData *d)
         d->img_ok = FALSE;
     }
     if (d->coverfile[0]) {
+#ifdef AMI_ECS
+        /* Das Farbbild, fertig auf die Palette dieses Albums gerastert. */
+        d->img_ok = cover_thumb(d->coverfile, COVER_PX, &d->img.rgb,
+                                &d->img.w, &d->img.h);
+#else
         d->img_ok = cover_load(d->coverfile, &d->img);
+#endif
     }
 }
 
@@ -117,9 +123,25 @@ static BOOL scale_cover(struct PanelData *d, LONG box)
      * Punkte gross - darueber hinaus wird es weich, aber ein Cover, das
      * in einer halbleeren Flaeche klein in der Mitte klebt, sieht
      * schlechter aus. */
+#ifdef AMI_ECS
+    /* Fertige Stifte: nur verkleinern, wenn die Flaeche kleiner ist. */
+    if (box >= d->img.w && box >= d->img.h) {
+        dst = malloc((size_t)(d->img.w * d->img.h));
+        if (!dst) {
+            return FALSE;
+        }
+        memcpy(dst, d->img.rgb, (size_t)(d->img.w * d->img.h));
+        dw = d->img.w;
+        dh = d->img.h;
+    } else if (!cover_scale_pens(d->img.rgb, d->img.w, d->img.h, box,
+                                 &dst, &dw, &dh)) {
+        return FALSE;
+    }
+#else
     if (!cover_scale_rgb(&d->img, box, TRUE, &dst, &dw, &dh)) {
         return FALSE;
     }
+#endif
 
     if (d->sc) {
         free(d->sc);
@@ -183,9 +205,16 @@ static void draw_gradient(Object *obj, struct PanelData *d)
     struct RastPort *rp = _rp(obj);
     LONG l = _mleft(obj), t = _mtop(obj);
     LONG w = _mwidth(obj), h = _mheight(obj);
-    if (w <= 0 || h <= 0 || !CyberGfxBase) {
+    if (w <= 0 || h <= 0 || !PIXOK) {
         return;
     }
+#ifdef AMI_ECS
+    /* Kein Verlauf auf ECS (Wunsch des Anwenders): eine feste Farbe aus
+     * dem Album. Sie steht in Stift 4 und wird dort beim Albumwechsel
+     * umgestellt (ecs_set_album). */
+    ecs_fill_pen(rp, l, t, w, h, EPEN_ALB);
+    return;
+#endif
     if (build_gradient(d, w, h)) {
         WritePixelArray(d->buf, 0, 0, (UWORD)(w * 4), rp,
                         (UWORD)l, (UWORD)t, (UWORD)w, (UWORD)h,
@@ -316,9 +345,15 @@ static void draw_shadow(Object *obj, struct PanelData *d,
     LONG y0, y1, x0, x1, y;
     LONG r0, g0, b0;
 
-    if (!CyberGfxBase || cvw <= 0 || cvh <= 0) {
+    if (!PIXOK || cvw <= 0 || cvh <= 0) {
         return;
     }
+#ifdef AMI_ECS
+    /* Auf ECS ein hartes Rechteck im dunklen Albumton - weiche Kanten
+     * gibt es mit 8 Farben nicht. */
+    ecs_fill_pen(rp, sx, sy, cvw, cvh, EPEN_ALBDK);
+    return;
+#endif
 
     y0 = sy - SH_BLUR;  y1 = sy + cvh + SH_BLUR;
     x0 = sx - SH_BLUR;  x1 = sx + cvw + SH_BLUR;
@@ -414,7 +449,15 @@ static ULONG panel_draw(struct IClass *cl, Object *obj,
          * grob, ohne mehr zu zeigen. Bei halber Groesse wird fast immer
          * VERKLEINERT, und das bleibt scharf. Der Leerraum darum ist
          * gewollt und gehoert zum Bild dieser Ansicht. */
+#ifdef AMI_ECS
+        /* Auf ECS NICHT halbieren: die Flaeche ist schon schmal, und das
+         * Cover kommt in genau COVER_PX - so wird nichts aufgeblasen. */
+        if (box > COVER_PX) {
+            box = COVER_PX;
+        }
+#else
         box /= 2;
+#endif
 
         /* Cover und Textzeilen sitzen als EIN Block mittig in der
          * Flaeche. Vorher klebten sie oben, und bei einem aufgezogenen
@@ -448,10 +491,34 @@ static ULONG panel_draw(struct IClass *cl, Object *obj,
              * picture.datatype dabei auf wenige Farben dithert
              * (PDTA_NumColors meldete 16). Ueber PDTM_READPIXELARRAY
              * kommen die Bildpunkte unveraendert. */
-            WritePixelArray((APTR)src, 0, 0, (UWORD)(srcw * 3), _rp(obj),
+            WritePixelArrayMode((APTR)src, 0, 0, (UWORD)(srcw * PIXBPP), _rp(obj),
                             (UWORD)(cx - iw / 2), (UWORD)y,
-                            (UWORD)iw, (UWORD)ih, RECTFMT_RGB);
+                            (UWORD)iw, (UWORD)ih, RECTFMT_RGB, PIX_COLOR);
             y += ih;
+        } else if (box > 8 && !d->coverfile[0]) {
+            /* Ausdruecklich KEIN Cover (ein Ordner ohne Bild, ein Album
+             * ohne coverArt): ein leeres Feld mit Hinweis. Vorher blieb
+             * hier das Bild des vorigen Albums stehen - beim Wechsel aus
+             * einem Podcast sah es aus, als sei man gar nicht
+             * umgeschaltet worden (Anwender, 13.10.2026). */
+            LONG top = t + (h - (box + 12 + textblock)) / 2;
+            struct TextFont *f = _font(obj);
+
+            if (top > y) {
+                y = top;
+            }
+#ifdef AMI_ECS
+            ecs_fill_pen(_rp(obj), cx - box / 2, y, box, box, EPEN_ALBDK);
+#else
+            FillPixelArray(_rp(obj), (UWORD)(cx - box / 2), (UWORD)y,
+                           (UWORD)box, (UWORD)box,
+                           cover_scale(d->colour, 55));
+#endif
+            if (f) {
+                draw_line(obj, "no cover", cx, y + (box - f->tf_YSize) / 2,
+                          box - 8, MPEN(obj, MPEN_HALFSHINE), FALSE);
+            }
+            y += box;
         } else {
             y += box > 0 ? box : 0;
         }
@@ -463,8 +530,8 @@ static ULONG panel_draw(struct IClass *cl, Object *obj,
      * funktioniert auf Truecolor genauso wie auf einem Palettenschirm,
      * und ein RPTAG_FgColor gibt es in den OS3-Headern nicht. */
     for (i = 0; i < NUM_LINES; i++) {
-        ULONG pen = _pens(obj)[(i == LINE_TITLE) ? MPEN_SHINE
-                                                 : MPEN_HALFSHINE];
+        ULONG pen = MPEN(obj, (i == LINE_TITLE) ? MPEN_SHINE
+                                                 : MPEN_HALFSHINE);
         if (i == LINE_META) {
             y += 6;
         }
@@ -572,12 +639,23 @@ static ULONG panel_askminmax(struct IClass *cl, Object *obj,
 
     /* Breit genug fuer ein 300er Cover mit Rand, hoch genug fuer Cover
      * plus vier Textzeilen. Wachsen darf es beliebig. */
+#ifdef AMI_ECS
+    /* Auf 640 Punkten fest 220 breit: Platz fuer das 160er Cover mit
+     * Rand, der Rest gehoert der Liste (Vorschau vom 13.10.2026). */
+    msg->MinMaxInfo->MinWidth  += 220;
+    msg->MinMaxInfo->MinHeight += 240;
+    msg->MinMaxInfo->DefWidth  += 220;
+    msg->MinMaxInfo->DefHeight += 420;
+    msg->MinMaxInfo->MaxWidth  += 220;
+    msg->MinMaxInfo->MaxHeight += MUI_MAXMAX;
+#else
     msg->MinMaxInfo->MinWidth  += 320;
     msg->MinMaxInfo->MinHeight += 240;
     msg->MinMaxInfo->DefWidth  += 340;
     msg->MinMaxInfo->DefHeight += 420;
     msg->MinMaxInfo->MaxWidth  += MUI_MAXMAX;
     msg->MinMaxInfo->MaxHeight += MUI_MAXMAX;
+#endif
     return 0;
 }
 
@@ -599,10 +677,13 @@ static ULONG panel_dispatch(struct IClass *cl  __asm("a0"),
 
 BOOL panel_init(void)
 {
+#ifndef AMI_ECS
+    /* Auf ECS gibt es kein cybergraphics - dort lenkt pix.h um. */
     CyberGfxBase = OpenLibrary("cybergraphics.library", 40);
     if (!CyberGfxBase) {
         return FALSE;
     }
+#endif
 
     /* MUIC_Area, NICHT MUIC_Group - siehe den Kopf von panel.h. */
     g_mcc = MUI_CreateCustomClass(NULL, MUIC_Area, NULL,

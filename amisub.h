@@ -22,6 +22,18 @@
  * Werte aus einer echten Bibliothek plus Reserve. Zu lange Angaben werden
  * abgeschnitten, nicht abgelehnt - ein Album mit sehr langem Titel soll
  * angezeigt werden, nicht das Holen zum Scheitern bringen. */
+/* Kantenlaenge, in der die Cover geholt werden. Auf ECS kleiner: ein
+ * 300er JPEG braucht auf dem 68030 10 bis 14 s zum Entpacken (gemessen
+ * auf der TF536, 13.10.2026), und groesser als 100 (Bildwand) bzw. 170
+ * (Playeransicht) wird es dort ohnehin nicht gezeigt. */
+#ifdef AMI_ECS
+#define COVER_PX      160
+#define COVER_PX_STR  "160x160"
+#else
+#define COVER_PX      300
+#define COVER_PX_STR  "300x300"
+#endif
+
 #define SUB_ID_LEN      40      /* Navidrome nimmt 22-stellige Base64-IDs */
 #define SUB_NAME_LEN   128
 #define SUB_ARTIST_LEN  96
@@ -69,6 +81,11 @@ struct Prefs {
      * liegt, stellt der Anwender einmal in den AHI-Voreinstellungen
      * ein - so macht es jedes andere Amiga-Programm auch. */
     int  ahiunit;
+
+    /* Nur ECS: Tonqualitaet 0 Low, 1 Medium (Vorgabe), 2 High. Gemessen
+     * auf der TF536 (13.10.2026): Low 11 kHz/mpega low 40 %, Medium
+     * 11 kHz/high 51 %, High 16 kHz/medium 58 % (vom Server als mp3a16). */
+    int  quality;
 
     /* Bilder je Sekunde des Visualizers: 0 (aus), 15, 20, 30 oder 60. Er
      * kostet je nach Maschine verschieden viel - auf der PiStorm bei 30
@@ -196,6 +213,14 @@ void list_init(struct SubList *l, int itemsize);
 void list_free(struct SubList *l);
 void *list_get(struct SubList *l, int index);
 void *list_add(struct SubList *l);     /* haengt ein genulltes Element an */
+
+/* Liste auf Platte und zurueck (Listen-Cache). extra: ein fester Block
+ * dazu (etwa die Albumdaten), extrasize 0 = keiner. list_load liefert
+ * FALSE, wenn die Datei fehlt oder nicht zu dieser Fassung passt. */
+BOOL list_save(const char *path, struct SubList *l, const void *extra,
+               LONG extrasize);
+BOOL list_load(const char *path, struct SubList *l, void *extra,
+               LONG extrasize);
 
 #define SUB_OK        0
 #define SUB_ENOPREFS  1         /* Einstellungen fehlen oder unvollstaendig */
@@ -424,6 +449,12 @@ void cache_path(struct Prefs *p, const char *coverartid,
 /* Legt das Cache-Verzeichnis an, falls noetig. SUB_OK oder ein Fehler.
  * Darf beliebig oft gerufen werden. */
 int  cache_ensure(struct Prefs *p);
+/* Nach einem Download nach cache_path(): auf ECS das JPEG in die fertige
+ * .ecs-Ablage umwandeln (cover.h). Sonst nichts. */
+int  cache_finish(const char *out);
+/* ECS: liegt zu diesem .ecs-Pfad noch ein JPEG da, wird es umgewandelt
+ * (TRUE) - dann muss nichts geholt werden. */
+BOOL cache_from_jpg(const char *out);
 
 /* Liegt das Cover schon da? Nur ein Lock(), kein malloc - die
  * Oberflaeche darf das also auch waehrend eines Netzauftrags fragen. */

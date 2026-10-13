@@ -6,8 +6,7 @@
 #include <proto/intuition.h>
 #include <proto/utility.h>
 #include <proto/muimaster.h>
-#include <proto/cybergraphics.h>
-#include <cybergraphx/cybergraphics.h>
+#include "pix.h"
 #include <intuition/intuition.h>
 #include <libraries/mui.h>
 #include <clib/alib_protos.h>
@@ -76,6 +75,7 @@ static LONG tab_width(Object *obj, struct TBData *d)
     return (d->count > 0) ? (w / d->count) : w;
 }
 
+#ifndef AMI_ECS
 static ULONG lighten(ULONG rgb, LONG add)
 {
     LONG r = ((rgb >> 16) & 0xff) + add;
@@ -91,6 +91,7 @@ static ULONG lighten(ULONG rgb, LONG add)
 
     return ((ULONG)r << 16) | ((ULONG)g << 8) | (ULONG)b;
 }
+#endif
 
 static ULONG tb_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
 {
@@ -120,10 +121,14 @@ static ULONG tb_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
      * beginnt oben mit genau dieser Farbe. Ein Vollton in derselben Farbe
      * setzt die Leiste also nahtlos auf die Liste - man sieht eine
      * Flaeche, keinen aufgesetzten Kasten. */
-    if (CyberGfxBase) {
+#ifdef AMI_ECS
+    ecs_fill_pen(rp, l, t, w, h, EPEN_ALB);
+#else
+    if (PIXOK) {
         FillPixelArray(rp, (UWORD)l, (UWORD)t, (UWORD)w, (UWORD)h,
                        d->colour);
     }
+#endif
 
     font = _font(obj);
     SetFont(rp, font);
@@ -145,18 +150,23 @@ static ULONG tb_draw(struct IClass *cl, Object *obj, struct MUIP_Draw *msg)
         /* Mittig im eigenen Abschnitt. */
         tx = x + (tw - TextLength(rp, (STRPTR)s, (ULONG)len)) / 2;
 
-        pen = _pens(obj)[(i == (int)d->active) ? MPEN_SHINE : MPEN_HALFSHINE];
+        pen = MPEN(obj, (i == (int)d->active) ? MPEN_SHINE : MPEN_HALFSHINE);
         SetAPen(rp, pen);
         Move(rp, (WORD)tx, (WORD)(t + TB_PAD_Y + font->tf_Baseline));
         Text(rp, (STRPTR)s, (ULONG)len);
 
         /* Der aktive Reiter bekommt einen Strich darunter - so macht es
          * das Vorbild, und es kommt ohne zweite Flaechenfarbe aus. */
-        if (i == (int)d->active && CyberGfxBase && tw > 16) {
+        if (i == (int)d->active && PIXOK && tw > 16) {
+#ifdef AMI_ECS
+            ecs_fill_pen(rp, x + 8, t + under_y(obj), tw - 16, TB_UNDER,
+                         EPEN_ALBLT);
+#else
             FillPixelArray(rp, (UWORD)(x + 8),
                            (UWORD)(t + under_y(obj)),
                            (UWORD)(tw - 16), TB_UNDER,
                            lighten(d->colour, 120));
+#endif
         }
     }
 

@@ -30,9 +30,9 @@
 #include "amisub.h"
 #include "cover.h"
 
-/* Kantenlaenge des Bildfeldes je Zelle. Oeffentlich, weil der
- * Auftraggeber die Miniaturen genau auf dieses Mass herunterrechnet. */
-#define AG_THUMB_SIZE 100
+/* AG_THUMB_SIZE (Kantenlaenge des Bildfeldes je Zelle) steht in
+ * cover.h - die ECS-Fassung legt die Miniaturen schon beim Holen in
+ * genau diesem Mass ab. */
 
 /* struct AlbumThumb steht in cover.h - die Titelliste braucht sie auch. */
 
@@ -60,6 +60,16 @@ struct MUIP_AG_SetList {
  * statt eines Attributs, weil sich am Zustand der Klasse nichts aendert;
  * die Daten liegen ja beim Auftraggeber. */
 #define MUIM_AG_Refresh (TAG_USER | 0x41414711)
+
+/* "Die Miniatur NUMMER idx ist dazugekommen" - zeichnet nur diese eine
+ * Kachel nach, statt die ganze Wand neu aufzubauen. Auf dem 68030 war
+ * das staendige Neuzeichnen beim Nachladen das, was am meisten nervte
+ * (Anwender, 13.10.2026). */
+#define MUIM_AG_RefreshCell (TAG_USER | 0x41414712)
+struct MUIP_AG_RefreshCell {
+    ULONG MethodID;
+    LONG  idx;
+};
 
 /* Nur zum Suchen: schreibt bei jedem Klick eine Zeile nach
  * RAM:AmiSubsonic/click.log - Mausposition, Rollstand, Spalten und der

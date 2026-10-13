@@ -645,7 +645,7 @@ int abs_cover_cached(struct Prefs *p, const char *coverid, int size,
     if (out[0] == '\0') {
         return abs_fail(SUB_EMEM, "cache path too long");
     }
-    if (cache_have(p, coverid)) {
+    if (cache_have(p, coverid) || cache_from_jpg(out)) {
         return SUB_OK;
     }
     rc = cache_ensure(p);
@@ -656,7 +656,7 @@ int abs_cover_cached(struct Prefs *p, const char *coverid, int size,
     /* format=jpeg: von sich aus liefert Audiobookshelf WebP (gemessen),
      * und dafuer hat kaum ein Amiga einen Datatype. */
     sprintf(path, "/api/items/%.40s/cover?width=%d&format=jpeg",
-            coverid + 3, size > 0 ? size : 300);
+            coverid + 3, size > 0 ? size : COVER_PX);
     rc = abs_call(p, "GET", path, NULL, &resp, &len);
     if (rc != SUB_OK) {
         out[0] = '\0';
@@ -678,5 +678,9 @@ int abs_cover_cached(struct Prefs *p, const char *coverid, int size,
     }
     Close(fh);
     free(resp);
-    return SUB_OK;
+    rc = cache_finish(out);
+    if (rc != SUB_OK) {
+        out[0] = '\0';
+    }
+    return rc;
 }

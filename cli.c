@@ -55,6 +55,40 @@ static volatile LONG  g_fill_waited = 0;   /* Sekunden Warten auf das Netz */
  * Verbindung, ID3-Etikett und Vorratspuffer, bis Ton kommt? */
 static volatile LONG  g_t_conn = 0, g_t_id3 = 0;
 
+/* Zaehler fuer "dl": laeuft auf Prioritaet -127 und zaehlt, solange
+ * g_spin_run gilt. Was er schafft, ist die freie CPU. */
+static volatile BOOL  g_spin_run = FALSE;
+static volatile ULONG g_spin_count = 0;
+static struct Task   *g_spin_task = NULL;
+static struct Task   *g_spin_parent = NULL;
+
+static void spinner(void)
+{
+    while (g_spin_run) {
+        g_spin_count++;
+    }
+    /* Melden, dass der Code hier nicht mehr laeuft. Forbid, damit das
+     * Signal erst ankommt, wenn dieser Prozess wirklich weg ist. */
+    Forbid();
+    Signal(g_spin_parent, SIGF_SINGLE);
+}
+
+/* Den Zaehler anhalten und WARTEN, bis er weg ist. Nur eine feste Zeit
+ * zu warten war falsch: unter Volllast kam er auf Prioritaet -127 nicht
+ * mehr dran, das Programm endete vorher, und der Zaehler lief danach in
+ * freigegebenen Code - Guru 80000004 auf der TF536 (13.10.2026). Deshalb
+ * vorher die Prioritaet anheben, damit er sofort aufhoert. */
+static void spin_stop(void)
+{
+    if (!g_spin_task) {
+        return;
+    }
+    g_spin_run = FALSE;
+    SetTaskPri(g_spin_task, 1);
+    Wait(SIGF_SINGLE);
+    g_spin_task = NULL;
+}
+
 static LONG ticks_now(void)
 {
     struct DateStamp ds;
@@ -1638,9 +1672,20 @@ static int run(int argc, char **argv)
     }
 
     if (stricmp(cmd, "ping") == 0) {
-        rc = sub_ping(&p);
-        if (rc == SUB_OK) {
-            printf("%s:%d - Anmeldung in Ordnung.\n", p.host, p.port);
+        /* ping [n]: n Anmeldungen hintereinander, je mit Zeit - zeigt,
+         * was die TLS-Wiederaufnahme ab der zweiten Verbindung spart. */
+        int i, n = (argc > 2) ? atoi(argv[2]) : 1;
+
+        for (i = 0; i < n; i++) {
+            LONG t0 = ticks_now(), t;
+
+            rc = sub_ping(&p);
+            t = ticks_now() - t0;
+            if (rc != SUB_OK) {
+                break;
+            }
+            printf("%s:%d - Anmeldung in Ordnung (%ld.%02ld s).\n",
+                   p.host, p.port, (long)(t / 50), (long)((t % 50) * 2));
         }
     } else if (stricmp(cmd, "artists") == 0) {
         rc = cmd_artists(&p);
@@ -1753,6 +1798,72 @@ static int run(int argc, char **argv)
             } else {
                 printf("Faktor       zu schnell zum Messen\n");
             }
+        }
+        rc = SUB_OK;
+    } else if (stricmp(cmd, "dl") == 0 && argc > 2) {
+        /* Messwerkzeug: wie schnell kommt ein Strom an, und was kostet
+         * das Holen die CPU? dl <titel-id|http-url> [kbytes]
+         * Die CPU-Last misst ein Zaehler auf niedrigster Prioritaet: er
+         * bekommt nur, was sonst niemand will. Erst 3 s ohne Download
+         * (Grundwert), dann mit. */
+        struct SubStream st;
+        static UBYTE dlbuf[16384];
+        long want = (argc > 3) ? atol(argv[3]) * 1024L : 2048L * 1024L;
+        long got = 0, n;
+        LONG t0, t1, b0, b1;
+        ULONG c0, c1, base;
+
+        g_spin_run = TRUE;
+        g_spin_count = 0;
+        g_spin_parent = FindTask(NULL);
+        SetSignal(0, SIGF_SINGLE);
+        g_spin_task = (struct Task *)CreateNewProcTags(
+                               NP_Entry, (ULONG)spinner,
+                               NP_Name, (ULONG)"AmiSubsonic.spin",
+                               NP_Priority, -127, TAG_DONE);
+        if (!g_spin_task) {
+            printf("Zaehler laesst sich nicht starten\n");
+            return 10;
+        }
+        Delay(25);
+        b0 = ticks_now();
+        c0 = g_spin_count;
+        Delay(150);
+        b1 = ticks_now();
+        c1 = g_spin_count;
+        base = (c1 - c0) / (ULONG)((b1 - b0) > 0 ? (b1 - b0) : 1);
+
+        if (strnicmp(argv[2], "http", 4) == 0) {
+            rc = sub_url_open(argv[2], NULL, 0, &st);
+        } else {
+            rc = sub_stream_open(&p, argv[2], 0, &st);
+        }
+        if (rc != SUB_OK) {
+            spin_stop();
+            printf("%s\n", sub_last_error());
+            return 10;
+        }
+        t0 = ticks_now();
+        c0 = g_spin_count;
+        while (got < want) {
+            n = sub_stream_read(&st, dlbuf, sizeof(dlbuf));
+            if (n <= 0) {
+                break;
+            }
+            got += n;
+        }
+        t1 = ticks_now();
+        c1 = g_spin_count;
+        sub_stream_close(&st);
+        spin_stop();
+        {
+            LONG dt = (t1 - t0) > 0 ? (t1 - t0) : 1;
+            ULONG rate = (c1 - c0) / (ULONG)dt;
+            LONG busy = base ? (LONG)(100 - (rate * 100UL) / base) : -1;
+
+            printf("%ld KB in %ld.%02ld s = %ld KB/s, CPU fuers Holen %ld %%\n",
+                   got / 1024, (long)(dt / 50), (long)((dt % 50) * 2),
+                   (long)((got / 1024) * 50 / dt), (long)busy);
         }
         rc = SUB_OK;
     } else if (stricmp(cmd, "stream") == 0 && argc > 2) {

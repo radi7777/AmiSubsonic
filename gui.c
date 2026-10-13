@@ -49,6 +49,9 @@
 #include "tracklist.h"
 #include "albumgrid.h"
 #include "sidebar.h"
+#ifdef AMI_ECS
+#include "ecsgfx.h"
+#endif
 #include "tabs.h"
 #include "visual.h"
 #include "player.h"
@@ -497,10 +500,16 @@ static Object *str_absurl, *str_absuser, *str_abspass;
 /* Fuer das Zykelfeld. MUSS ein Feld von Zeigern sein, das bis zum Ende
  * des Programms lebt - MUI kopiert die Liste nicht. */
 static const char *g_ahi_units[] = { "0", "1", "2", "3", NULL };
+#ifdef AMI_ECS
+/* ECS: an der Stelle des Visualizers die Tonqualitaet (amisub.h). */
+static const char *g_qualities[] = { "Low", "Medium", "High", NULL };
+#endif
 static Object *cyc_vis;
+#ifndef AMI_ECS
 static const char *g_vis_rates[] = { "Off", "15 fps", "20 fps", "30 fps",
                                      "60 fps", NULL };
 static const int   g_vis_fps[]   = { 0, 15, 20, 30, 60 };
+#endif
 static Object *btn_mode, *btn_save, *btn_cancel;
 static Object *panel;
 
@@ -512,6 +521,64 @@ static Object *panel;
  * Umschalten auf eine bis dahin unsichtbare Seite noch einmal gesetzt
  * werden muss. */
 static ULONG g_tint = 0x00281640;
+
+/* LISTEN-CACHE (Wunsch des Anwenders, 13.10.2026: "alles cachen und nur
+ * Netz, wenn wirklich noetig"). Albenlisten, Titel, Favoriten, Sender
+ * und die Titel jedes geoeffneten Albums liegen als Datei im Cache-
+ * Verzeichnis; beim Start kommt alles von dort, auch Home. Den Server
+ * fragt nur Scan - danach gilt fuer den Rest der Sitzung g_lists_net,
+ * und was dabei kommt, ersetzt die alten Dateien. Audiobookshelf bleibt
+ * live: dort geht es um die Hoerposition von anderen Geraeten. */
+static BOOL g_lists_net = FALSE;
+
+static void albums_fill(void);
+static void tracks_fill(void);
+static void favs_fill(void);
+static void radios_fill(void);
+static void album_fill(void);
+
+/* Pfad einer Listendatei: prefix + Kennung im Cache-Verzeichnis. Lange
+ * Kennungen werden gekuerzt und bekommen einen Streuwert - FFS nimmt nur
+ * 30 Zeichen (siehe cache_path). */
+static void list_file(const char *prefix, const char *id, char *out,
+                      int size)
+{
+    const char *dir = g_prefs.cache[0] ? g_prefs.cache : "PROGDIR:Cache";
+    char name[48];
+    int n = (int)strlen(dir);
+
+    sprintf(name, "%.3s%.40s", prefix, id ? id : "");
+    if (strlen(name) > 26) {
+        ULONG h = 2166136261UL;
+        const char *q;
+
+        for (q = id; *q; q++) {
+            h = (h ^ (UBYTE)*q) * 16777619UL;
+        }
+        sprintf(name + 17, "-%08lx", (unsigned long)(h & 0xffffffffUL));
+    }
+    out[0] = '\0';
+    if (n + (int)strlen(name) + 6 > size) {
+        return;
+    }
+    sprintf(out, "%s%s%s.lst", dir,
+            (n > 0 && dir[n - 1] != ':' && dir[n - 1] != '/') ? "/" : "",
+            name);
+}
+
+#ifdef AMI_ECS
+/* Erstbefuellung aller Cover - siehe pre_step(). */
+static struct SubList g_pre;            /* struct Album, alphabetisch */
+static int  g_pre_state = 0;            /* 0 noch nicht, 1 Liste kommt,
+                                         * 2 Cover, 3 fertig */
+static int  g_pre_idx   = 0;
+static int  g_pre_new   = 0;            /* in diesem Durchgang geholt */
+static int  g_pre_fails = 0;
+static int  g_pre_hold  = 0;            /* Sekunden Pause nach Fehlern */
+static BOOL g_pre_list_job  = FALSE;
+static BOOL g_pre_cover_job = FALSE;
+static char g_pre_msg[64];
+#endif
 
 /* Die Verlaufsbild-Bastelei ist ersatzlos entfallen: die Listen
  * zeichnen ihren Verlauf jetzt selbst (tracklist.c). Damit fallen auch
@@ -756,11 +823,32 @@ static void cover_ready(const char *path)
          * den Hintergrund am Register, wird auch die aktive Lasche dunkel
          * und ihre Beschriftung unlesbar. */
         g_tint = cover_scale(top, 50);
+#ifdef AMI_ECS
+        /* Auf ECS faerbt sich die Flaeche ueber die Palette um. */
+        ecs_set_album(rgb);
+#endif
         tint_all();
     }
     /* NUR die Anzeigeflaeche. Die Bedienleiste behaelt das Cover des
      * laufenden Titels - sie bekommt ihres in now_show(). */
     set(panel, MUIA_Panel_Cover, (ULONG)path);
+}
+
+/* Das gezeigte Album hat KEIN Cover: Flaeche leeren (sie zeigt dann "no
+ * cover") und neutrale Farbe - sonst blieben Bild und Farbton des
+ * vorigen Albums stehen. */
+#define COVER_NONE_RGB 0x00404040UL
+
+static void cover_none(void)
+{
+    g_coverpath[0] = '\0';
+    set(panel, MUIA_Panel_Colour, cover_gradient_top(COVER_NONE_RGB));
+    g_tint = cover_scale(cover_gradient_top(COVER_NONE_RGB), 50);
+#ifdef AMI_ECS
+    ecs_set_album(COVER_NONE_RGB);
+#endif
+    tint_all();
+    set(panel, MUIA_Panel_Cover, (ULONG)"");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1426,10 +1514,8 @@ static BOOL thumb_load(int idx, const char *path)
     if (idx < 0 || idx >= g_thumb_count || !g_thumbs) {
         return FALSE;
     }
-    if (!cover_load(path, &img)) {
-        return FALSE;
-    }
-    if (cover_scale_rgb(&img, AG_THUMB_SIZE, FALSE, &rgb, &w, &h)) {
+    (void)img;
+    if (cover_thumb(path, AG_THUMB_SIZE, &rgb, &w, &h)) {
         if (g_thumbs[idx].rgb) {
             free(g_thumbs[idx].rgb);
         }
@@ -1437,7 +1523,6 @@ static BOOL thumb_load(int idx, const char *path)
         g_thumbs[idx].w   = w;
         g_thumbs[idx].h   = h;
     }
-    cover_unload(&img);
     return rgb != NULL;
 }
 
@@ -1490,7 +1575,7 @@ static BOOL thumbs_step(void)
         if (!thumb_load(g_fill_idx, path)) {
             g_fill_gap = TRUE;
         }
-        DoMethod(grid, MUIM_AG_Refresh);
+        DoMethod(grid, MUIM_AG_RefreshCell, g_fill_idx);
         g_fill_idx++;
         return TRUE;
     }
@@ -1505,7 +1590,7 @@ static BOOL thumbs_step(void)
 
     memset(&g_job, 0, sizeof(g_job));
     g_job.op   = NJ_COVER;
-    g_job.size = 300;
+    g_job.size = COVER_PX;
     strncpy(g_job.id, cov, sizeof(g_job.id) - 1);
     if (!net_submit(&g_job)) {
         return FALSE;
@@ -1541,6 +1626,17 @@ static void albums_request(void)
     thumbs_free();
     list_free(&g_albums);
     list_init(&g_albums, sizeof(struct Album));
+
+    {
+        char lp[256];
+
+        list_file("ls-", (g_set_cur == VIEW_HOME) ? "home" : "albums",
+                  lp, sizeof(lp));
+        if (!g_lists_net && lp[0] && list_load(lp, &g_albums, NULL, 0)) {
+            albums_fill();
+            return;
+        }
+    }
 
     memset(&g_job, 0, sizeof(g_job));
     g_job.op       = NJ_ALBUMS;
@@ -1753,6 +1849,21 @@ static void tracks_request(void)
         return;
     }
 
+    if (g_track_offset == 0 && !g_lists_net) {
+        char lp[256], msg[64];
+
+        list_file("ls-", "tracks", lp, sizeof(lp));
+        if (lp[0] && list_load(lp, &g_tracks, NULL, 0)) {
+            /* Ganz da, kein Blaettern: tracks_fill() hielte die volle
+             * Liste sonst fuer eine volle Seite und fragte weiter. */
+            tracks_fill();
+            g_track_more = FALSE;
+            sprintf(msg, "%d tracks", g_tracks.count);
+            say(msg);
+            return;
+        }
+    }
+
     memset(&g_job, 0, sizeof(g_job));
     g_job.op       = NJ_TRACKS;
     g_job.size     = TRACK_PAGE;
@@ -1810,6 +1921,16 @@ static BOOL track_icon_try(const char *path)
     UBYTE *rgb = NULL;
     LONG w = 0, h = 0;
 
+#ifdef AMI_ECS
+    /* Auf ECS wie ein Cover: einmal gerastert abgelegt, dann gelesen. */
+    (void)img;
+    if (cover_thumb(path, TL_THUMB_SIZE, &rgb, &w, &h)) {
+        g_track_icon.rgb = rgb;
+        g_track_icon.w   = w;
+        g_track_icon.h   = h;
+    }
+    return rgb != NULL;
+#else
     if (!cover_load(path, &img)) {
         return FALSE;
     }
@@ -1822,6 +1943,7 @@ static BOOL track_icon_try(const char *path)
     }
     cover_unload(&img);
     return rgb != NULL;
+#endif
 }
 
 /* Die Endungen einzeln abgefragt statt ueber ein Feld von Zeigern: so
@@ -1848,10 +1970,11 @@ static BOOL thumb_small_load(struct AlbumThumb *th, const char *path)
     UBYTE *rgb = NULL;
     LONG w = 0, h = 0;
 
-    if (!th || !cover_load(path, &img)) {
+    (void)img;
+    if (!th) {
         return FALSE;
     }
-    if (cover_scale_rgb(&img, TL_THUMB_SIZE, FALSE, &rgb, &w, &h)) {
+    if (cover_thumb(path, TL_THUMB_SIZE, &rgb, &w, &h)) {
         if (th->rgb) {
             free(th->rgb);
         }
@@ -1859,7 +1982,6 @@ static BOOL thumb_small_load(struct AlbumThumb *th, const char *path)
         th->w   = w;
         th->h   = h;
     }
-    cover_unload(&img);
     return rgb != NULL;
 }
 
@@ -1939,7 +2061,7 @@ static BOOL track_covers_step(void)
 
     memset(&g_job, 0, sizeof(g_job));
     g_job.op   = NJ_COVER;
-    g_job.size = 300;
+    g_job.size = COVER_PX;
     strncpy(g_job.id, cs->id, sizeof(g_job.id) - 1);
     if (!net_submit(&g_job)) {
         return FALSE;
@@ -1959,6 +2081,16 @@ static void favs_request(void)
 
     list_free(&g_favs);
     list_init(&g_favs, sizeof(struct Song));
+
+    {
+        char lp[256];
+
+        list_file("ls-", "favs", lp, sizeof(lp));
+        if (!g_lists_net && lp[0] && list_load(lp, &g_favs, NULL, 0)) {
+            favs_fill();
+            return;
+        }
+    }
 
     memset(&g_job, 0, sizeof(g_job));
     g_job.op       = NJ_FAVORITES;
@@ -2117,7 +2249,7 @@ static BOOL radio_covers_step(void)
 
     memset(&g_job, 0, sizeof(g_job));
     g_job.op   = NJ_COVER;
-    g_job.size = 300;
+    g_job.size = COVER_PX;
     strncpy(g_job.id, cid, sizeof(g_job.id) - 1);
     if (!net_submit(&g_job)) {
         return FALSE;
@@ -2300,6 +2432,21 @@ static void screen_open(void)
 {
     ULONG pens[] = { ~0UL };    /* Farbwahl wie die Workbench */
 
+#ifdef AMI_ECS
+    /* Die ECS-Fassung laeuft IMMER auf eigenem Bildschirm: 8 Farben,
+     * davon drei in der Albumfarbe, die beim Albumwechsel umgestellt
+     * werden - auf der Workbench ginge das nicht. Ein in den Settings
+     * gewaehlter Modus wird genommen, sonst Hires-Interlace. */
+    g_screen = ecs_screen_open(g_prefs.ownscreen ? g_prefs.screenid : 0,
+                               "AMISUBSONIC");
+    if (g_screen) {
+        g_pubname = "AMISUBSONIC";
+        ecs_set_album(0x00512D7E);
+    }
+    (void)pens;
+    return;
+#endif
+
     if (!g_prefs.ownscreen) {
         return;
     }
@@ -2337,6 +2484,10 @@ static void screen_open(void)
 
 static void screen_close(void)
 {
+#ifdef AMI_ECS
+    ecs_screen_close();
+    g_screen = NULL;
+#endif
     if (g_screen) {
         CloseScreen(g_screen);
         g_screen = NULL;
@@ -2447,6 +2598,9 @@ static void prefs_open(void)
     set(str_user, MUIA_String_Contents, (ULONG)g_prefs.user);
     set(str_pass, MUIA_String_Contents, (ULONG)g_prefs.pass);
     set(cyc_ahi, MUIA_Cycle_Active, (ULONG)g_prefs.ahiunit);
+#ifdef AMI_ECS
+    set(cyc_vis, MUIA_Cycle_Active, (ULONG)g_prefs.quality);
+#else
     {
         ULONG i;
 
@@ -2456,6 +2610,7 @@ static void prefs_open(void)
             }
         }
     }
+#endif
     set(str_folder, MUIA_String_Contents, (ULONG)g_prefs.folder);
     set(str_absurl,  MUIA_String_Contents, (ULONG)g_prefs.absurl);
     set(str_absuser, MUIA_String_Contents, (ULONG)g_prefs.absuser);
@@ -2554,6 +2709,8 @@ static void data_reset(void)
 static void reconnect(void)
 {
     data_reset();
+    /* Anderer Server: die abgelegten Listen gehoeren zum alten. */
+    g_lists_net = TRUE;
 
     memset(&g_job, 0, sizeof(g_job));
     g_job.op = NJ_RESOLVE;
@@ -2579,6 +2736,14 @@ static void rescan(void)
     }
 
     data_reset();
+    /* Ab jetzt frisch vom Server - und das Frische ersetzt die Dateien. */
+    g_lists_net = TRUE;
+#ifdef AMI_ECS
+    /* Neue Alben bekommen ihre Cover ebenfalls - fehlende werden geholt,
+     * vorhandene nur abgehakt. */
+    g_pre_state = 0;
+    g_pre_hold = 0;
+#endif
 
     /* Der eigene Bestand wird MITGENOMMEN. Er haengt nicht am Server,
      * aber "Aktualisieren" soll alles auffrischen, was angezeigt wird -
@@ -2657,6 +2822,19 @@ static void prefs_apply(void)
         get(cyc_ahi, MUIA_Cycle_Active, &u);
         g_prefs.ahiunit = (int)u;
     }
+#ifdef AMI_ECS
+    {
+        LONG u = 1;
+
+        /* Wirkt ab dem naechsten Titel. */
+        get(cyc_vis, MUIA_Cycle_Active, &u);
+        if (u < 0 || u > 2) {
+            u = 1;
+        }
+        g_prefs.quality = (int)u;
+        audio_set_quality(u);
+    }
+#else
     {
         LONG u = 3;
 
@@ -2668,6 +2846,7 @@ static void prefs_apply(void)
         g_prefs.visfps = g_vis_fps[u];
         set(visual, MUIA_Vis_Fps, (ULONG)g_prefs.visfps);
     }
+#endif
     {
         char old[192];
 
@@ -2753,6 +2932,16 @@ static void radios_request(void)
 
     list_free(&g_radios);
     list_init(&g_radios, sizeof(struct Radio));
+
+    {
+        char lp[256];
+
+        list_file("ls-", "radio", lp, sizeof(lp));
+        if (!g_lists_net && lp[0] && list_load(lp, &g_radios, NULL, 0)) {
+            radios_fill();
+            return;
+        }
+    }
 
     memset(&g_job, 0, sizeof(g_job));
     g_job.op       = NJ_RADIOS;
@@ -3012,6 +3201,8 @@ static void falbum_open(int idx)
                     g_prefs.cache, path, sizeof(path))) {
         strncpy(g_coverpath, path, sizeof(g_coverpath) - 1);
         cover_ready(g_coverpath);
+    } else {
+        cover_none();
     }
 
     {
@@ -3021,6 +3212,129 @@ static void falbum_open(int idx)
         say(msg);
     }
 }
+
+#ifdef AMI_ECS
+/* Erstbefuellung: ALLE Cover der Bibliothek einmal holen und als fertige
+ * .ecs-Ablage hinlegen (Wunsch des Anwenders, 13.10.2026). Danach kommt
+ * jede Ansicht ohne Netz und ohne JPEG aus; neue Alben holt Scan.
+ *
+ * Die Oberflaeche hat Vorrang: ein Abruf geht nur, wenn der Netzprozess
+ * frei ist, kein Klick wartet und die sichtbare Wand fertig ist - und
+ * hoechstens einer je Sekunde (g_fill_token). Umgewandelt wird im
+ * Netzprozess mit niedrigerer Prioritaet (ecs_cover_convert). */
+
+static BOOL pre_step(void)
+{
+    struct Album *a;
+    char cov[SUB_ID_LEN];
+    int n;
+
+    if (g_pre_state == 0) {
+        if (!g_have_prefs || g_albums.count == 0 || g_fill_idx >= 0
+                || g_want_album >= 0 || net_busy() || g_pre_hold > 0
+                || !g_fill_token) {
+            return FALSE;
+        }
+        g_fill_token = FALSE;
+        list_free(&g_pre);
+        {
+            char lp[256];
+
+            /* Auch diese Liste aus dem Cache - sonst kostete jeder Start
+             * einen TLS-Handschlag (18 s auf dem 68030), waehrend dessen
+             * jeder Klick auf ein Album wartet. */
+            list_file("ls-", "all", lp, sizeof(lp));
+            if (!g_lists_net && lp[0] && list_load(lp, &g_pre, NULL, 0)) {
+                g_pre_state = 2;
+                g_pre_idx = 0;
+                g_pre_new = 0;
+                return TRUE;
+            }
+        }
+        memset(&g_job, 0, sizeof(g_job));
+        g_job.op = NJ_ALBUMS;
+        g_job.size = 500;               /* das Hoechste, was Subsonic nimmt */
+        strcpy(g_job.listtype, "alphabeticalByName");
+        g_job.out_list = &g_pre;
+        if (!net_submit(&g_job)) {
+            return FALSE;
+        }
+        g_pre_list_job = TRUE;
+        g_pre_state = 1;
+        g_pre_idx = 0;
+        g_pre_new = 0;
+        return TRUE;
+    }
+    if (g_pre_state != 2 || g_fill_idx >= 0 || g_want_album >= 0
+            || net_busy() || g_pre_hold > 0) {
+        return FALSE;
+    }
+
+    /* Was schon daliegt, nur abhaken - ein Lock je Album, kein Netz. */
+    for (n = 0; n < 20 && g_pre_idx < g_pre.count; n++) {
+        a = (struct Album *)list_get(&g_pre, g_pre_idx);
+        if (!a || !a->coverart[0]) {
+            g_pre_idx++;
+            continue;
+        }
+        sub_album_cover_id(a->id, cov, sizeof(cov));
+        if (cache_have(&g_prefs, cov)) {
+            g_pre_idx++;
+            continue;
+        }
+        if (!g_fill_token) {
+            return n > 0;
+        }
+        g_fill_token = FALSE;
+        memset(&g_job, 0, sizeof(g_job));
+        g_job.op   = NJ_COVER;
+        g_job.size = COVER_PX;
+        strncpy(g_job.id, cov, sizeof(g_job.id) - 1);
+        if (!net_submit(&g_job)) {
+            return FALSE;
+        }
+        g_pre_cover_job = TRUE;
+        sprintf(g_pre_msg, "caching covers %d/%d ...", g_pre_idx + 1,
+                g_pre.count);
+        say(g_pre_msg);
+        return TRUE;
+    }
+    if (g_pre_idx >= g_pre.count) {
+        char msg[64];
+
+        g_pre_state = 3;
+        g_pre_msg[0] = '\0';
+        if (g_pre_new > 0) {
+            sprintf(msg, "all covers cached (%d new)", g_pre_new);
+            say(msg);
+        }
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Ein eben fertig gewordenes Cover gleich in die sichtbare Wand, falls
+ * sein Album dort ohne Bild steht. */
+static void pre_show(const char *cov, const char *path)
+{
+    int i;
+    char c[SUB_ID_LEN];
+
+    for (i = 0; i < g_albums.count && i < g_thumb_count; i++) {
+        struct Album *a = (struct Album *)list_get(&g_albums, i);
+
+        if (!a || (g_thumbs && g_thumbs[i].rgb)) {
+            continue;
+        }
+        sub_album_cover_id(a->id, c, sizeof(c));
+        if (strcmp(c, cov) == 0) {
+            thumb_load(i, path);
+            DoMethod(grid, MUIM_AG_RefreshCell, i);
+            break;
+        }
+    }
+}
+#endif
 
 /* Ein Schritt beim Fuellen der eigenen Bildwand.
  *
@@ -3047,6 +3361,26 @@ static BOOL lthumbs_step(void)
         UBYTE *rgb = NULL;
         LONG w = 0, h = 0;
 
+#ifdef AMI_ECS
+        /* Auf ECS liegen beide Groessen fertig in der .ecs-Ablage - beim
+         * ersten Mal wandelt cover_thumb() das Bild um. */
+        (void)img;
+        if (cover_thumb(path, AG_THUMB_SIZE, &rgb, &w, &h)) {
+            g_lthumbs[g_lfill_idx].rgb = rgb;
+            g_lthumbs[g_lfill_idx].w   = w;
+            g_lthumbs[g_lfill_idx].h   = h;
+            DoMethod(grid_folder, MUIM_AG_RefreshCell, g_lfill_idx);
+        }
+        rgb = NULL;
+        if (g_lsmall && cover_thumb(path, TL_THUMB_SIZE, &rgb, &w, &h)) {
+            g_lsmall[g_lfill_idx].rgb = rgb;
+            g_lsmall[g_lfill_idx].w   = w;
+            g_lsmall[g_lfill_idx].h   = h;
+            if (g_page == PAGE_FOLDER) {
+                MUI_Redraw(lst_folder, MADF_DRAWOBJECT);
+            }
+        }
+#else
         if (cover_load(path, &img)) {
             /* Zweimal verkleinern aus DEMSELBEN geladenen Bild: gross
              * fuer die Bildwand, klein fuer die Zeilen. Das Laden ist
@@ -3055,7 +3389,7 @@ static BOOL lthumbs_step(void)
                 g_lthumbs[g_lfill_idx].rgb = rgb;
                 g_lthumbs[g_lfill_idx].w   = w;
                 g_lthumbs[g_lfill_idx].h   = h;
-                DoMethod(grid_folder, MUIM_AG_Refresh);
+                DoMethod(grid_folder, MUIM_AG_RefreshCell, g_lfill_idx);
             }
             if (g_lsmall) {
                 rgb = NULL;
@@ -3071,6 +3405,7 @@ static BOOL lthumbs_step(void)
             }
             cover_unload(&img);
         }
+#endif
     }
 
     g_lfill_idx++;
@@ -3245,15 +3580,13 @@ static void athumb_load(int idx, const char *path)
     if (idx < 0 || idx >= g_abalbums.count || !g_athumbs) {
         return;
     }
-    if (cover_load(path, &img)) {
-        if (cover_scale_rgb(&img, AG_THUMB_SIZE, FALSE, &rgb, &w, &h)) {
-            g_athumbs[idx].rgb = rgb;
-            g_athumbs[idx].w   = w;
-            g_athumbs[idx].h   = h;
-        }
-        cover_unload(&img);
+    (void)img;
+    if (cover_thumb(path, AG_THUMB_SIZE, &rgb, &w, &h)) {
+        g_athumbs[idx].rgb = rgb;
+        g_athumbs[idx].w   = w;
+        g_athumbs[idx].h   = h;
     }
-    DoMethod(grid_abs, MUIM_AG_Refresh);
+    DoMethod(grid_abs, MUIM_AG_RefreshCell, idx);
 }
 
 /* Ein Schritt beim Fuellen der Buecherwand. Liegt das Cover im Cache,
@@ -3285,7 +3618,7 @@ static BOOL abs_thumbs_step(void)
     memset(&g_job, 0, sizeof(g_job));
     g_job.op = NJ_COVER;
     strcpy(g_job.id, a->coverart);
-    g_job.size = 300;
+    g_job.size = COVER_PX;
     if (net_submit(&g_job)) {
         g_acover_job = TRUE;
     }
@@ -3543,15 +3876,13 @@ static void pthumb_load(int idx, const char *path)
     if (idx < 0 || idx >= g_palbums.count || !g_pthumbs) {
         return;
     }
-    if (cover_load(path, &img)) {
-        if (cover_scale_rgb(&img, AG_THUMB_SIZE, FALSE, &rgb, &w, &h)) {
-            g_pthumbs[idx].rgb = rgb;
-            g_pthumbs[idx].w   = w;
-            g_pthumbs[idx].h   = h;
-        }
-        cover_unload(&img);
+    (void)img;
+    if (cover_thumb(path, AG_THUMB_SIZE, &rgb, &w, &h)) {
+        g_pthumbs[idx].rgb = rgb;
+        g_pthumbs[idx].w   = w;
+        g_pthumbs[idx].h   = h;
     }
-    DoMethod(grid_pod, MUIM_AG_Refresh);
+    DoMethod(grid_pod, MUIM_AG_RefreshCell, idx);
 }
 
 /* Wie abs_thumbs_step(): aus dem Cache sofort, sonst EIN Abruf je
@@ -4122,6 +4453,18 @@ static void album_request_id(const char *albumid)
     sub_album_cover_id(albumid, g_pending_cover, sizeof(g_pending_cover));
     g_pending_cover[sizeof(g_pending_cover) - 1] = '\0';
 
+    {
+        char lp[256];
+
+        list_file("as-", albumid, lp, sizeof(lp));
+        if (!g_lists_net && lp[0]
+                && list_load(lp, &g_songs, &g_pending_album,
+                             sizeof(g_pending_album))) {
+            album_fill();
+            return;
+        }
+    }
+
     memset(&g_job, 0, sizeof(g_job));
     g_job.op        = NJ_ALBUM_SONGS;
     strncpy(g_job.id, albumid, sizeof(g_job.id) - 1);
@@ -4161,7 +4504,16 @@ static void album_fill(void)
     {
         const char *cid = g_pending_album.coverart[0]
                         ? g_pending_album.coverart : g_pending_cover;
+        char acid[SUB_ID_LEN];
         char msg[64];
+
+        /* Dieselbe Kennung OHNE Hash wie Bildwand und Titelliste - sonst
+         * holte die Flaeche dasselbe Bild ein zweites Mal, unter einem
+         * zweiten Namen (gesehen auf der TF536, 13.10.2026). */
+        if (g_pending_album.coverart[0] && g_pending_album.id[0]) {
+            sub_album_cover_id(g_pending_album.id, acid, sizeof(acid));
+            cid = acid;
+        }
 
         if (cid[0] && cache_have(&g_prefs, cid)) {
             cache_path(&g_prefs, cid, g_coverpath, sizeof(g_coverpath));
@@ -4171,11 +4523,12 @@ static void album_fill(void)
         } else if (cid[0]) {
             memset(&g_job, 0, sizeof(g_job));
             g_job.op   = NJ_COVER;
-            g_job.size = 300;
+            g_job.size = COVER_PX;
             strncpy(g_job.id, cid, sizeof(g_job.id) - 1);
             g_thumb_job = FALSE;        /* dieses Cover ist fuers Panel */
             net_submit(&g_job);
         } else {
+            cover_none();
             sprintf(msg, "%d tracks loaded", g_songs.count);
             say(msg);
         }
@@ -4278,6 +4631,8 @@ static void wants_step(void)
 
 static void job_done(struct NetJob *j)
 {
+    char lpath[256];
+
     if (j->rc != SUB_OK && j->op == NJ_COVER) {
         cover_fail_log(j);
     }
@@ -4303,6 +4658,25 @@ static void job_done(struct NetJob *j)
             }
             return;
         }
+#ifdef AMI_ECS
+        if (j->op == NJ_COVER && g_pre_cover_job) {
+            /* Dieses Album hat keins, oder das Netz ist weg: weiter,
+             * nach drei Fehlschlaegen in Folge eine Minute Pause. */
+            g_pre_cover_job = FALSE;
+            g_pre_idx++;
+            if (++g_pre_fails >= 3) {
+                g_pre_fails = 0;
+                g_pre_hold = 60;
+            }
+            return;
+        }
+        if (j->op == NJ_ALBUMS && g_pre_list_job) {
+            g_pre_list_job = FALSE;
+            g_pre_state = 0;
+            g_pre_hold = 60;
+            return;
+        }
+#endif
         if (j->op == NJ_COVER && g_pcover_job) {
             g_pcover_job = FALSE;
             if (g_pfill >= 0 && ++g_pfill >= g_palbums.count) {
@@ -4411,7 +4785,22 @@ static void job_done(struct NetJob *j)
         break;
 
     case NJ_ALBUMS:
+#ifdef AMI_ECS
+        if (g_pre_list_job) {
+            /* Die ganze Bibliothek fuer die Erstbefuellung - sie wird
+             * nirgends angezeigt, nur abgearbeitet (pre_step). */
+            g_pre_list_job = FALSE;
+            g_pre_state = 2;
+            g_pre_idx = 0;
+            list_file("ls-", "all", lpath, sizeof(lpath));
+            list_save(lpath, &g_pre, NULL, 0);
+            break;
+        }
+#endif
         g_list_job = FALSE;
+        list_file("ls-", (g_set_cur == VIEW_HOME) ? "home" : "albums",
+                  lpath, sizeof(lpath));
+        list_save(lpath, &g_albums, NULL, 0);
         albums_fill();
         break;
 
@@ -4441,17 +4830,29 @@ static void job_done(struct NetJob *j)
 
     case NJ_TRACKS:
         tracks_fill();
+        if (!g_track_more) {
+            /* Erst die ganze Liste ablegen, keine halbe. */
+            list_file("ls-", "tracks", lpath, sizeof(lpath));
+            list_save(lpath, &g_tracks, NULL, 0);
+        }
         break;
 
     case NJ_FAVORITES:
+        list_file("ls-", "favs", lpath, sizeof(lpath));
+        list_save(lpath, &g_favs, NULL, 0);
         favs_fill();
         break;
 
     case NJ_RADIOS:
+        list_file("ls-", "radio", lpath, sizeof(lpath));
+        list_save(lpath, &g_radios, NULL, 0);
         radios_fill();
         break;
 
     case NJ_ALBUM_SONGS:
+        list_file("as-", g_cur_album, lpath, sizeof(lpath));
+        list_save(lpath, &g_songs, &g_pending_album,
+                  sizeof(g_pending_album));
         album_fill();
         break;
 
@@ -4522,6 +4923,14 @@ static void job_done(struct NetJob *j)
                 now_cover_late(g_cslots[g_cslot_fill].id, j->path);
                 g_cslot_fill++;
             }
+#ifdef AMI_ECS
+        } else if (g_pre_cover_job) {
+            g_pre_cover_job = FALSE;
+            g_pre_fails = 0;
+            g_pre_new++;
+            g_pre_idx++;
+            pre_show(j->id, j->path);
+#endif
         } else if (g_thumb_job && g_thumb_job_view != g_set_cur) {
             /* Waehrend der Abruf lief, wurde die Ansicht gewechselt. Das
              * Bild gehoert zur anderen Wand und wird hier NICHT
@@ -4535,7 +4944,7 @@ static void job_done(struct NetJob *j)
             if (!thumb_load(g_fill_idx, j->path)) {
                 g_fill_gap = TRUE;
             }
-            DoMethod(grid, MUIM_AG_Refresh);
+            DoMethod(grid, MUIM_AG_RefreshCell, g_fill_idx);
             g_fill_idx++;
         } else {
             char msg[64];
@@ -4584,6 +4993,17 @@ static void tick(void)
     g_fill_token = TRUE;
 
     say_expire();
+
+#ifdef AMI_ECS
+    if (g_pre_hold > 0) {
+        g_pre_hold--;
+    }
+    /* Die Anzeige stehen lassen, solange ein Cover umgewandelt wird -
+     * say() blendet nach 3 s aus, ein Cover dauert laenger. */
+    if (g_pre_cover_job && g_pre_msg[0]) {
+        say(g_pre_msg);
+    }
+#endif
 
     /* Was auf freie Bahn wartet, nachholen - siehe wants_step(). */
     wants_step();
@@ -4841,13 +5261,22 @@ int main(void)
 {
     ULONG sigs = 0;
     ULONG id;
+#ifdef AMI_ECS
+    /* Kein Visualizer auf ECS: FFT und Linie je Bild kosten einen 68030
+     * mehr, als neben dem Dekoder uebrig ist. */
+    static const char *reg_titles[] = { "UP NEXT", "LYRICS", NULL };
+#else
     static const char *reg_titles[] = { "UP NEXT", "LYRICS", "VISUALIZER",
                                         NULL };
+#endif
 
     list_init(&g_albums, sizeof(struct Album));
     list_init(&g_songs, sizeof(struct Song));
     list_init(&g_tracks, sizeof(struct Song));
     list_init(&g_favs, sizeof(struct Song));
+#ifdef AMI_ECS
+    list_init(&g_pre, sizeof(struct Album));
+#endif
     list_init(&g_abooks, sizeof(struct AbsBook));
     list_init(&g_abalbums, sizeof(struct Album));
     list_init(&g_abs_tracks, sizeof(struct AbsTrack));
@@ -4931,6 +5360,11 @@ int main(void)
     g_tint = cover_scale(0x00512D7E, 50);
 
     g_have_prefs = (prefs_load(&g_prefs) == SUB_OK);
+#ifdef AMI_ECS
+    /* Fuer die .ecs-Ablage von Bildern ausserhalb des Caches. */
+    cover_set_cachedir(g_prefs.cache);
+    audio_set_quality(g_prefs.quality);
+#endif
 
     /* VOR dem Anlegen der Fenster: sie bekommen den Namen des
      * Bildschirms mit, auf dem sie aufgehen sollen. */
@@ -5130,6 +5564,15 @@ int main(void)
                         MUIA_Frame,        MUIV_Frame_Button,
                         MUIA_Cycle_Entries, (ULONG)g_ahi_units,
                         TAG_DONE),
+#ifdef AMI_ECS
+                    MUIA_Group_Child, MUI_MakeObject(MUIO_Label,
+                        (ULONG)"Audio quality", 0),
+                    MUIA_Group_Child, cyc_vis = MUI_NewObject(MUIC_Cycle,
+                        MUIA_Frame,        MUIV_Frame_Button,
+                        MUIA_Cycle_Entries, (ULONG)g_qualities,
+                        MUIA_Cycle_Active, 1,
+                        TAG_DONE),
+#else
                     MUIA_Group_Child, MUI_MakeObject(MUIO_Label,
                         (ULONG)"Visualizer", 0),
                     MUIA_Group_Child, cyc_vis = MUI_NewObject(MUIC_Cycle,
@@ -5137,6 +5580,7 @@ int main(void)
                         MUIA_Cycle_Entries, (ULONG)g_vis_rates,
                         MUIA_Cycle_Active, 3,
                         TAG_DONE),
+#endif
                     TAG_DONE),
 
                 MUIA_Group_Child, MUI_NewObject(MUIC_Group,
@@ -5238,11 +5682,29 @@ int main(void)
             TAG_DONE),
 
         MUIA_Application_Window, win = MUI_NewObject(MUIC_Window,
+#ifdef AMI_ECS
+            /* Randlos ueber den ganzen eigenen Bildschirm, ohne
+             * Fenster-ID: eine gemerkte Groesse soll hier nichts
+             * verstellen. Beenden geht ueber "Quit" in der Leiste. */
+            MUIA_Window_Title,        NULL,
+            MUIA_Window_PublicScreen, (ULONG)g_pubname,
+            MUIA_Window_Backdrop,     TRUE,
+            MUIA_Window_Borderless,   TRUE,
+            MUIA_Window_CloseGadget,  FALSE,
+            MUIA_Window_DepthGadget,  FALSE,
+            MUIA_Window_SizeGadget,   FALSE,
+            MUIA_Window_DragBar,      FALSE,
+            MUIA_Window_LeftEdge,     0,
+            MUIA_Window_TopEdge,      0,
+            MUIA_Window_Width,        MUIV_Window_Width_Screen(100),
+            MUIA_Window_Height,       MUIV_Window_Height_Screen(100),
+#else
             MUIA_Window_Title,  "AmiSubsonic",
             MUIA_Window_ID,     0x41535542UL,   /* 'ASUB' */
             MUIA_Window_PublicScreen, (ULONG)g_pubname,
             MUIA_Window_Width,  760,
             MUIA_Window_Height, 560,
+#endif
             MUIA_Window_RootObject, MUI_NewObject(MUIC_Group,
                 MUIA_Group_Spacing, 0,
 
@@ -5539,6 +6001,10 @@ int main(void)
                  * sie war. */
                 prefs_open();
                 break;
+            case SB_QUIT:
+                DoMethod(app, MUIM_Application_ReturnID,
+                         MUIV_Application_ReturnID_Quit);
+                break;
             }
             break;
         }
@@ -5832,7 +6298,11 @@ int main(void)
          * Signal anliegt - ohne zu warten. Liegt keines an, geht es
          * sofort mit dem naechsten Bild weiter. */
         if (track_covers_step() || radio_covers_step() || thumbs_step()
-                || lthumbs_step() || abs_thumbs_step() || pod_thumbs_step()) {
+                || lthumbs_step() || abs_thumbs_step() || pod_thumbs_step()
+#ifdef AMI_ECS
+                || pre_step()
+#endif
+                ) {
             ULONG have = SetSignal(0, 0) & (g_tsig | net_signal());
 
             if (!have) {

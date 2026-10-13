@@ -91,6 +91,38 @@ to the program.
 - The visualizer costs about 12 % of a PiStorm at 30 fps and roughly 30 % at
   60 fps. It only computes while its tab is visible; "Off" leaves a flat line.
 - `AmiSubsonicCLI` is a shell tool for testing without the interface.
+- Album lists, track lists, favourites, radio stations and covers are kept
+  in the cache directory. At start everything comes from there, without the
+  network; **Scan** fetches fresh data from the server. Audiobookshelf stays
+  live because of the listening position.
+
+### 68030 / ECS version (work in progress)
+
+A second build for plain Amigas without graphics card, tested on an A500
+with a 68030 (TF536, 50 MHz) and ECS: `AmiSubsonicECS`.
+
+- Own screen, 640 pixels wide (PAL or NTSC height), 8 colours, in the
+  Workbench screen font. No gradients: the player view takes one solid
+  colour from the album, the album wall is grey. Covers are dithered.
+- Every cover is fetched **once**, converted and stored ready to show
+  (`.ecs` files in the cache) - decoding a JPEG takes seconds on a 68030.
+  At first start all covers of the library are converted, with progress in
+  the status line.
+- Sound: MP3 decoded in mono at 11 to 16 kHz through AHI/Paula. Settings
+  -> **Audio quality**: Low, Medium (default) or High.
+- Faster with two optional server settings (it works without them, only
+  with more CPU load):
+  - Navidrome transcodings `mp3a22` and `mp3a16` (target format name,
+    command e.g. `ffmpeg -i %s -ss %t -map 0:a:0 -ac 1 -ar 22050 -b:a %bk
+    -v 0 -f mp3 -`, 48 resp. 40 kbit/s; 16000 Hz for `mp3a16`). Other
+    clients are not affected.
+  - The **plain HTTP** address of the server in your home network instead
+    of HTTPS. A TLS handshake takes about 18 seconds on a 68030.
+- Recommended AHI unit: "Paula: Fast 14 bit mono calibrated" at 16000 Hz.
+  It costs half of what the usual 27 kHz stereo mode costs.
+- A network card in the expansion port is much better than a Plipbox: the
+  Plipbox alone takes most of the CPU of a 68030 while data comes in.
+- No visualizer, no AAC radio.
 
 ### Building
 
@@ -98,6 +130,7 @@ Cross-compiled with [m68k-amigaos-gcc](https://github.com/AmigaPorts/m68k-amigao
 
 ```sh
 make                 # AmiSubsonic + AmiSubsonicCLI
+make ecs             # AmiSubsonicECS, the 68030/ECS version
 make check-fpu       # proves no FPU instruction is in the binaries
 make TOOLCHAIN=/path/to/m68k-amigaos-gcc
 ```
@@ -195,11 +228,45 @@ dem Programm.
   60 Bildern je Sekunde. Er rechnet nur, solange sein Reiter zu sehen ist;
   „Off“ zeigt eine ruhende Linie.
 - `AmiSubsonicCLI` ist ein Shell-Werkzeug zum Testen ohne Oberfläche.
+- Albenlisten, Titellisten, Favoriten, Sender und Cover liegen im Cache-
+  Verzeichnis. Beim Start kommt alles von dort, ohne Netz; **Scan** holt
+  alles frisch vom Server. Audiobookshelf bleibt live, wegen der
+  Hörposition.
+
+### Fassung für 68030 / ECS (in Arbeit)
+
+Eine zweite Fassung für Amigas ohne Grafikkarte, getestet auf einem A500
+mit 68030 (TF536, 50 MHz) und ECS: `AmiSubsonicECS`.
+
+- Eigener Bildschirm, 640 Punkte breit (PAL- oder NTSC-Höhe), 8 Farben, in
+  der Bildschirmschrift der Workbench. Keine Farbverläufe: Die
+  Playeransicht nimmt eine feste Farbe aus dem Album, die Bildwand ist grau.
+  Cover werden gerastert.
+- Jedes Cover wird **einmal** geholt, umgewandelt und fertig abgelegt
+  (`.ecs`-Dateien im Cache) - ein JPEG zu entpacken dauert auf einem 68030
+  Sekunden. Beim ersten Start werden alle Cover der Bibliothek umgewandelt,
+  mit Fortschritt in der Statuszeile.
+- Ton: MP3 in Mono mit 11 bis 16 kHz über AHI/Paula. Settings ->
+  **Audio quality**: Low, Medium (Vorgabe) oder High.
+- Schneller mit zwei freiwilligen Einstellungen am Server (es geht auch
+  ohne, nur mit mehr CPU-Last):
+  - Navidrome-Umkodierungen `mp3a22` und `mp3a16` (Name des Zielformats,
+    Befehl z. B. `ffmpeg -i %s -ss %t -map 0:a:0 -ac 1 -ar 22050 -b:a %bk
+    -v 0 -f mp3 -`, 48 bzw. 40 kbit/s; 16000 Hz für `mp3a16`). Andere
+    Clients merken davon nichts.
+  - Die **HTTP**-Adresse des Servers im Heimnetz statt HTTPS. Ein
+    TLS-Handschlag dauert auf einem 68030 etwa 18 Sekunden.
+- Empfohlene AHI-Unit: „Paula: Fast 14 bit mono calibrated“ mit 16000 Hz.
+  Sie kostet halb so viel wie der übliche 27-kHz-Stereo-Modus.
+- Eine Netzwerkkarte am Erweiterungsport ist viel besser als eine Plipbox:
+  Die Plipbox allein belegt den größten Teil eines 68030, solange Daten
+  hereinkommen.
+- Kein Visualizer, kein AAC-Radio.
 
 ### Bauen und Lizenz
 
 Siehe den englischen Teil: gebaut wird mit m68k-amigaos-gcc (`make`,
-`make check-fpu`), die MUI-Header und `libraries/mpega.h` muss man selbst
+`make ecs` für die 68030/ECS-Fassung, `make check-fpu`), die MUI-Header und `libraries/mpega.h` muss man selbst
 beschaffen. Lizenz MIT, `muistubs.c` Apache 2.0, der AAC-Dekoder in
 `vendor/helix-aac/` steht unter der RealNetworks Public Source License.
 

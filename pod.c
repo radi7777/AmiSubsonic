@@ -135,7 +135,7 @@ static int search_cb(const struct JsonEv *ev, void *ud)
         }
         p = strstr(c->cur->image, "600x600");
         if (p) {
-            memcpy(p, "300x300", 7);
+            memcpy(p, COVER_PX_STR, 7);
         }
         /* Ohne Feed-Adresse (manche Eintraege) laesst sich nichts
          * abonnieren - wieder weg damit. */
@@ -1076,7 +1076,7 @@ int pod_cover_cached(struct Prefs *p, const struct PodShow *s,
 
     pod_cover_id(s->id, cid);
     cache_path(p, cid, out, outsize);
-    if (cache_have(p, cid)) {
+    if (cache_have(p, cid) || cache_from_jpg(out)) {
         return SUB_OK;
     }
     if (!s->image[0]) {
@@ -1114,5 +1114,9 @@ int pod_cover_cached(struct Prefs *p, const struct PodShow *s,
         out[0] = '\0';
         return pod_fail(SUB_ENET, "cover download broken off");
     }
-    return SUB_OK;
+    rc = cache_finish(out);
+    if (rc != SUB_OK) {
+        out[0] = '\0';
+    }
+    return rc;
 }

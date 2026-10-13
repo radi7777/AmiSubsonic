@@ -4,6 +4,7 @@
 build/
 /AmiSubsonic
 /AmiSubsonicCLI
+/AmiSubsonicECS
 __pycache__/
 
 # MUI developer headers and the original mpega header - not
